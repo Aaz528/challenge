@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Запрос к LLM API: произвольный запрос пользователя и 4 варианта ответа."""
+"""Запрос к LLM API: один ввод пользователя и 4 варианта ответа."""
 
 import os
 import requests
@@ -12,10 +12,8 @@ BASE_URL = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
 MODEL = os.environ.get("LLM_MODEL", "gpt-3.5-turbo")
 
 
-def ask_llm(messages: list[dict], stop: list[str] | None = None) -> str:
+def ask_llm(messages: list[dict]) -> str:
     payload = {"model": MODEL, "messages": messages}
-    if stop:
-        payload["stop"] = stop
     resp = requests.post(
         f"{BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
@@ -36,43 +34,46 @@ def main():
         print("Запрос не может быть пустым.")
         return
 
-    messages = [{"role": "user", "content": prompt}]
+    base_messages = [{"role": "user", "content": prompt}]
 
     # 1. Просто ответ
     print("\n--- 1. Просто ответ ---")
-    print(ask_llm(messages))
+    print(ask_llm(base_messages))
 
-    # 2. Сначала описание формата, затем ответ в этом формате
-    print("\n--- 2. Ответ с явным форматом ---")
-    format_prompt = (
-        f"Запрос: {prompt}\n\n"
-        "Опиши явно формат ответа (структура, стиль, объём), в котором нужно ответить. "
-        "Дай только описание формата, без самого ответа."
+    # 2. Добавить условие "решать пошагово"
+    print("\n--- 2. Ответ: решать пошагово ---")
+    step_by_step_messages = [
+        {
+            "role": "user",
+            "content": f"{prompt}\n\nУсловие: решать пошагово.",
+        }
+    ]
+    print(ask_llm(step_by_step_messages))
+
+    # 3. Сначала составить промт на первоначальный запрос, затем отправить этот промт и получить ответ
+    print("\n--- 3. Сгенерировать промт -> ответить по нему ---")
+    prompt_builder = (
+        "Составь лучший промт (одной строкой или несколькими), чтобы другая LLM максимально качественно "
+        "ответила на следующий пользовательский запрос. Верни ТОЛЬКО сам промт, без пояснений.\n\n"
+        f"Пользовательский запрос:\n{prompt}"
     )
-    format_desc = ask_llm([{"role": "user", "content": format_prompt}])
-    answer_with_format_prompt = (
-        f"Запрос: {prompt}\n\n"
-        f"Формат ответа:\n{format_desc}\n\n"
-        "Дай ответ строго по этому формату."
+    improved_prompt = ask_llm([{"role": "user", "content": prompt_builder}])
+    print("\n[Промт]\n" + improved_prompt)
+    print("\n[Ответ]\n" + ask_llm([{"role": "user", "content": improved_prompt}]))
+
+    # 4. Эксперты (аналитик, инженер, критик) на базе промта из 3-го варианта
+    print("\n--- 4. Эксперты: аналитик / инженер / критик ---")
+    expert_base = (
+        "Ниже промт. Ответь на него в рамках своей роли.\n\n"
+        f"{improved_prompt}"
     )
-    print(ask_llm([{"role": "user", "content": answer_with_format_prompt}]))
-
-    # 3. Ограничение длины
-    length_hint = input("\nОграничение длины (например: в одном предложении, до 50 слов; Enter = по умолчанию): ").strip()
-    if not length_hint:
-        length_hint = "не более двух предложений"
-    print("\n--- 3. Ответ с ограничением длины ---")
-    length_prompt = f"{prompt}\n\nОграничение: {length_hint}."
-    print(ask_llm([{"role": "user", "content": length_prompt}]))
-
-    # 4. Stop sequence
-    stop_input = input("\nStop sequence (например \\n\\n или ---; Enter = по умолчанию): ").strip()
-    if not stop_input:
-        stop_seq = "\n\n"
-    else:
-        stop_seq = stop_input.replace("\\n", "\n").replace("\\t", "\t")
-    print("\n--- 4. Ответ с условием завершения (stop) ---")
-    print(ask_llm(messages, stop=[stop_seq]))
+    experts: list[tuple[str, str]] = [
+        ("Аналитик", "Ты аналитик. Дай структурированный анализ и обоснования. Если нужны допущения — явно перечисли."),
+        ("Инженер", "Ты инженер. Дай практичное решение: шаги, алгоритм, примеры, детали реализации."),
+        ("Критик", "Ты критик. Найди слабые места, риски, альтернативы, и как улучшить ответ/решение."),
+    ]
+    for title, system_msg in experts:
+        print(f"\n[{title}]\n" + ask_llm([{"role": "system", "content": system_msg}, {"role": "user", "content": expert_base}]))
 
 
 if __name__ == "__main__":
