@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 from pathlib import Path
 import sys
@@ -20,16 +21,44 @@ def _print_result(result) -> None:
     print("-" * 60)
 
 
+def _serialize_toon(messages: list[dict[str, str]]) -> str:
+    # TOON v1: одна строка на сообщение, контент в base64 (utf-8), чтобы не терять переносы.
+    lines = ["TOON/1"]
+    for message in messages:
+        role = str(message.get("role", "")).strip()
+        content = str(message.get("content", ""))
+        payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        lines.append(f"{role}\t{payload}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_toon(text: str) -> list[dict[str, str]]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "TOON/1":
+        raise ValueError("Неизвестный формат TOON")
+
+    messages: list[dict[str, str]] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        role, payload = line.split("\t", 1)
+        content = base64.b64decode(payload.encode("ascii")).decode("utf-8")
+        messages.append({"role": role, "content": content})
+    return messages
+
+
 def _load_session(session_file: Path, system_prompt: str) -> ConversationState:
     if not session_file.exists():
         return ConversationState.new(system_prompt)
     try:
-        data = json.loads(session_file.read_text(encoding="utf-8"))
-        messages = data.get("messages")
-        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-            # Минимальная валидация: первое сообщение должно быть system.
-            if messages[0].get("role") == "system":
-                return ConversationState(messages=messages)  # type: ignore[arg-type]
+        raw = session_file.read_text(encoding="utf-8")
+        if session_file.suffix.lower() == ".toon":
+            messages = _parse_toon(raw)
+        else:
+            data = json.loads(raw)
+            messages = data.get("messages")
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            return ConversationState(messages=messages)  # type: ignore[arg-type]
         return ConversationState.new(system_prompt)
     except Exception:
         return ConversationState.new(system_prompt)
@@ -37,10 +66,13 @@ def _load_session(session_file: Path, system_prompt: str) -> ConversationState:
 
 def _save_session(session_file: Path, conversation: ConversationState) -> None:
     session_file.parent.mkdir(parents=True, exist_ok=True)
-    session_file.write_text(
-        json.dumps({"messages": conversation.messages}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    if session_file.suffix.lower() == ".toon":
+        session_file.write_text(_serialize_toon(conversation.messages), encoding="utf-8")
+    else:
+        session_file.write_text(
+            json.dumps({"messages": conversation.messages}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,8 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--session-file",
         type=str,
-        default="",
-        help="JSON-файл для сохранения истории диалога. Если задан — контекст сохраняется между запусками.",
+        default="chat.toon",
+        help="Файл сессии (.toon рекомендован). Контекст сохраняется между запусками.",
     )
     parser.add_argument(
         "--reset-session",
@@ -109,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Если prompt не задан — ведем диалог (контекст сохраняется в рамках процесса).
+    print("Режим диалога: введите запрос. Для выхода: exit | quit | q | /exit")
     while True:
         user_in = input("Вы: ").strip()
         if not user_in:
