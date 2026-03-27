@@ -76,66 +76,78 @@ class LLMAgent:
     def new_conversation(self) -> ConversationState:
         return ConversationState.new(self._system_prompt)
 
-    def chat_turn(self, conversation: ConversationState, user_query: str) -> AgentResult:
+    def chat_turn_with_messages(
+        self,
+        base_messages: list[dict[str, str]],
+        user_query: str,
+    ) -> AgentResult:
         """
-        Один “ход” диалога: добавляет user в историю, запрашивает LLM с полной историей,
-        добавляет assistant в историю и возвращает результат.
+        Один ход диалога на произвольном наборе сообщений (без мутации базы сообщений).
         """
         user_query = (user_query or "").strip()
         if not user_query:
             raise ValueError("Пустой запрос.")
 
-        if not self._config.api_key:
-            raise RuntimeError("OPENAI_API_KEY не задан в .env")
+        messages = [*base_messages, {"role": "user", "content": user_query}]
+        return self._complete(messages, temperature=self._temperature, max_tokens=self._max_tokens)
 
+    def summarize_messages(self, messages: list[dict[str, str]]) -> str:
+        """
+        Делает краткую сводку переданных сообщений для дальнейшего использования в контексте.
+        """
+        if not messages:
+            return ""
+
+        text_parts: list[str] = []
+        for item in messages:
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                text_parts.append(f"{role.upper()}: {content}")
+
+        summarize_prompt = (
+            "Сделай краткую структурированную сводку диалога ниже.\n"
+            "Требования:\n"
+            "1) 5-10 буллетов.\n"
+            "2) Сохрани факты, принятые решения, ограничения и открытые вопросы.\n"
+            "3) Никакой выдумки, только то, что есть в диалоге.\n\n"
+            "Диалог:\n"
+            + "\n".join(text_parts)
+        )
+
+        res = self._complete(
+            messages=[
+                {"role": "system", "content": "Ты помощник, который делает точные сводки диалогов."},
+                {"role": "user", "content": summarize_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=700,
+        )
+        return res.text
+
+    def chat_turn(self, conversation: ConversationState, user_query: str) -> AgentResult:
+        """
+        Один “ход” диалога: добавляет user в историю, запрашивает LLM с полной историей,
+        добавляет assistant в историю и возвращает результат.
+        """
         # На случай поврежденного/чужого состояния: гарантируем system в начале.
         if not conversation.messages:
             conversation.messages = ConversationState.new(self._system_prompt).messages
         elif conversation.messages[0].get("role") != "system":
             conversation.messages = ConversationState.new(self._system_prompt).messages + conversation.messages
 
+        user_query = (user_query or "").strip()
+        if not user_query:
+            raise ValueError("Пустой запрос.")
+
+        result = self._complete(
+            messages=[*conversation.messages, {"role": "user", "content": user_query}],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
         conversation.messages.append({"role": "user", "content": user_query})
-
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": conversation.messages,
-            "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
-        }
-
-        headers = {
-            "Authorization": f"Bearer {self._config.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        t0 = time.perf_counter()
-        resp = requests.post(
-            f"{self._config.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=self._timeout_sec,
-        )
-        elapsed = time.perf_counter() - t0
-
-        resp.raise_for_status()
-        data = resp.json()
-
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError("LLM вернул неожиданный формат ответа") from e
-
-        text = str(content).strip()
-        conversation.messages.append({"role": "assistant", "content": text})
-
-        usage = self._parse_usage(data.get("usage"))
-        return AgentResult(
-            text=text,
-            model=self._config.model,
-            usage=usage,
-            elapsed_sec=elapsed,
-            raw=data if os.environ.get("DEBUG_LLM_AGENT") else None,
-        )
+        conversation.messages.append({"role": "assistant", "content": result.text})
+        return result
 
     def run(self, user_query: str) -> AgentResult:
         """
@@ -166,5 +178,44 @@ class LLMAgent:
             total_tokens=int(total_tokens) if total_tokens is not None else None,
             prompt_tokens=int(prompt_tokens) if prompt_tokens is not None else None,
             completion_tokens=int(completion_tokens) if completion_tokens is not None else None,
+        )
+
+    def _complete(self, messages: list[dict[str, str]], *, temperature: float, max_tokens: int) -> AgentResult:
+        if not self._config.api_key:
+            raise RuntimeError("OPENAI_API_KEY не задан в .env")
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": "application/json",
+        }
+        t0 = time.perf_counter()
+        resp = requests.post(
+            f"{self._config.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=self._timeout_sec,
+        )
+        elapsed = time.perf_counter() - t0
+        resp.raise_for_status()
+        data = resp.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError("LLM вернул неожиданный формат ответа") from e
+
+        text = str(content).strip()
+        usage = self._parse_usage(data.get("usage"))
+        return AgentResult(
+            text=text,
+            model=self._config.model,
+            usage=usage,
+            elapsed_sec=elapsed,
+            raw=data if os.environ.get("DEBUG_LLM_AGENT") else None,
         )
 
