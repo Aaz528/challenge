@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -125,6 +127,31 @@ class LLMAgent:
         )
         return res.text
 
+    def complete_messages(self, messages: list[dict[str, str]]) -> AgentResult:
+        """Полный список сообщений без добавления user снаружи (один запрос к LLM)."""
+        if not messages:
+            raise ValueError("Пустой список сообщений.")
+        return self._complete(messages, temperature=self._temperature, max_tokens=self._max_tokens)
+
+    def merge_sticky_facts(self, existing: dict[str, str], dialogue_snippet: str) -> tuple[dict[str, str], AgentResult]:
+        """Обновляет key-value факты по фрагменту диалога. Отдельный вызов LLM с низкой температурой."""
+        prompt = (
+            "Ты ведёшь память диалога в виде JSON-объекта (строковые ключи и значения).\n"
+            "Есть текущие факты и фрагмент диалога. Обнови факты: добавь новые, исправь противоречия, "
+            "удали явно устаревшее. Верни ТОЛЬКО валидный JSON-объект, без markdown и пояснений.\n\n"
+            f"Текущие факты:\n{json.dumps(existing, ensure_ascii=False)}\n\n"
+            f"Фрагмент диалога:\n{dialogue_snippet}\n"
+        )
+        res = self._complete(
+            messages=[
+                {"role": "system", "content": "Ты помощник для структурированной памяти диалога."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1500,
+        )
+        return _parse_json_object(res.text), res
+
     def chat_turn(self, conversation: ConversationState, user_query: str) -> AgentResult:
         """
         Один “ход” диалога: добавляет user в историю, запрашивает LLM с полной историей,
@@ -218,4 +245,24 @@ class LLMAgent:
             elapsed_sec=elapsed,
             raw=data if os.environ.get("DEBUG_LLM_AGENT") else None,
         )
+
+
+def _parse_json_object(text: str) -> dict[str, str]:
+    t = (text or "").strip()
+    if not t:
+        return {}
+    if t.startswith("```"):
+        inner = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+        inner = re.sub(r"\s*```\s*$", "", inner)
+        t = inner.strip()
+    try:
+        data = json.loads(t)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        out[str(k)] = str(v) if v is not None else ""
+    return out
 

@@ -34,3 +34,42 @@ class CLISettings:
 SETTINGS = CLISettings()
 SUMMARY_SETTINGS = SummarySettings()
 
+
+@dataclass(frozen=True)
+class WebSettings:
+    """HTTP API (FastAPI)."""
+    host: str = "127.0.0.1"
+    port: int = 8000
+    cors_origins: tuple[str, ...] = (
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    )
+
+
+WEB_SETTINGS = WebSettings()
+
+
+# Стратегии памяти ветки (см. chat_service / sqlite_chat_storage)
+MEMORY_STRATEGY_DEFAULT = "default"
+MEMORY_STRATEGY_SUMMARY = "summary"
+MEMORY_STRATEGY_SLIDING = "sliding_window"
+MEMORY_STRATEGY_STICKY = "sticky_facts"
+MEMORY_STRATEGIES = (
+    MEMORY_STRATEGY_DEFAULT,
+    MEMORY_STRATEGY_SUMMARY,
+    MEMORY_STRATEGY_SLIDING,
+    MEMORY_STRATEGY_STICKY,
+)
+
+
+@dataclass(frozen=True)
+class MemoryStrategyDefaults:
+    """Параметры по умолчанию для strategy_params_json (переопределяются в ветке)."""
+    # sliding_window: сколько последних сообщений user+assistant держать в БД и в промпте
+    sliding_window_messages: int = 20
+    # sticky_facts: сколько последних сообщений user+assistant добавлять к facts в промпт
+    sticky_tail_messages: int = 12
+
+
+MEMORY_DEFAULTS = MemoryStrategyDefaults()
+
