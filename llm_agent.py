@@ -45,6 +45,13 @@ class AgentResult:
     raw: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class ToolCallSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
 @dataclass
 class ConversationState:
     messages: list[dict[str, str]]
@@ -152,6 +159,105 @@ class LLMAgent:
         )
         return _parse_json_object(res.text), res
 
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[ToolCallSpec],
+        tool_executor,
+        max_rounds: int = 4,
+    ) -> AgentResult:
+        """Запускает chat completion с function-calling и возвращает финальный assistant текст."""
+        if not messages:
+            raise ValueError("Пустой список сообщений.")
+
+        msg: list[dict[str, Any]] = [dict(m) for m in messages]
+        tool_defs = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in tools
+        ]
+
+        total_prompt = 0
+        total_completion = 0
+        total_tokens = 0
+        elapsed_total = 0.0
+        model_name = self._config.model
+        raw_last: dict[str, Any] | None = None
+
+        for _ in range(max_rounds):
+            data, elapsed = self._complete_raw(
+                msg,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                tools=tool_defs,
+            )
+            elapsed_total += elapsed
+            raw_last = data if os.environ.get("DEBUG_LLM_AGENT") else None
+            usage = self._parse_usage(data.get("usage"))
+            if usage.prompt_tokens is not None:
+                total_prompt += usage.prompt_tokens
+            if usage.completion_tokens is not None:
+                total_completion += usage.completion_tokens
+            if usage.total_tokens is not None:
+                total_tokens += usage.total_tokens
+
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            model_name = str(data.get("model") or self._config.model)
+            tool_calls = message.get("tool_calls")
+
+            if not isinstance(tool_calls, list) or not tool_calls:
+                content = str(message.get("content") or "").strip()
+                return AgentResult(
+                    text=content,
+                    model=model_name,
+                    usage=LLMUsage(
+                        total_tokens=total_tokens or None,
+                        prompt_tokens=total_prompt or None,
+                        completion_tokens=total_completion or None,
+                    ),
+                    elapsed_sec=elapsed_total,
+                    raw=raw_last,
+                )
+
+            msg.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            for tc in tool_calls:
+                tc_id = str(tc.get("id", ""))
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                fn_name = str(fn.get("name", "")).strip()
+                raw_args = str(fn.get("arguments", "{}"))
+                try:
+                    parsed_args = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
+                tool_result = tool_executor(fn_name, parsed_args)
+                if not isinstance(tool_result, str):
+                    tool_result = json.dumps(tool_result, ensure_ascii=False)
+                msg.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": tool_result,
+                    }
+                )
+
+        raise RuntimeError("Не удалось завершить tool-calling за разумное число шагов.")
+
     def chat_turn(self, conversation: ConversationState, user_query: str) -> AgentResult:
         """
         Один “ход” диалога: добавляет user в историю, запрашивает LLM с полной историей,
@@ -207,7 +313,32 @@ class LLMAgent:
             completion_tokens=int(completion_tokens) if completion_tokens is not None else None,
         )
 
-    def _complete(self, messages: list[dict[str, str]], *, temperature: float, max_tokens: int) -> AgentResult:
+    def _complete(self, messages: list[dict[str, Any]], *, temperature: float, max_tokens: int) -> AgentResult:
+        data, elapsed = self._complete_raw(messages, temperature=temperature, max_tokens=max_tokens)
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError("LLM вернул неожиданный формат ответа") from e
+
+        text = str(content).strip()
+        usage = self._parse_usage(data.get("usage"))
+        model_name = str(data.get("model") or self._config.model)
+        return AgentResult(
+            text=text,
+            model=model_name,
+            usage=usage,
+            elapsed_sec=elapsed,
+            raw=data if os.environ.get("DEBUG_LLM_AGENT") else None,
+        )
+
+    def _complete_raw(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], float]:
         if not self._config.api_key:
             raise RuntimeError("OPENAI_API_KEY не задан в .env")
 
@@ -217,6 +348,9 @@ class LLMAgent:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
@@ -231,20 +365,7 @@ class LLMAgent:
         elapsed = time.perf_counter() - t0
         resp.raise_for_status()
         data = resp.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError("LLM вернул неожиданный формат ответа") from e
-
-        text = str(content).strip()
-        usage = self._parse_usage(data.get("usage"))
-        return AgentResult(
-            text=text,
-            model=self._config.model,
-            usage=usage,
-            elapsed_sec=elapsed,
-            raw=data if os.environ.get("DEBUG_LLM_AGENT") else None,
-        )
+        return data, elapsed
 
 
 def _parse_json_object(text: str) -> dict[str, str]:

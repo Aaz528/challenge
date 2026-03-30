@@ -116,6 +116,112 @@ export async function fetchBranchFacts(
   );
 }
 
+export type MemoryItem = {
+  key: string;
+  value: string;
+  updated_at: string;
+};
+
+export async function fetchWorkingMemory(
+  chatId: number,
+  branchId: number,
+): Promise<MemoryItem[]> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/working-memory`),
+  );
+}
+
+export async function putWorkingMemoryItem(
+  chatId: number,
+  branchId: number,
+  key: string,
+  value: string,
+): Promise<MemoryItem> {
+  return json(
+    await fetch(
+      `/api/chats/${chatId}/branches/${branchId}/working-memory/${encodeURIComponent(key)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      },
+    ),
+  );
+}
+
+export async function deleteWorkingMemoryItem(
+  chatId: number,
+  branchId: number,
+  key: string,
+): Promise<{ deleted: boolean }> {
+  return json(
+    await fetch(
+      `/api/chats/${chatId}/branches/${branchId}/working-memory/${encodeURIComponent(key)}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+export async function clearWorkingMemory(
+  chatId: number,
+  branchId: number,
+): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(
+      `/api/chats/${chatId}/branches/${branchId}/working-memory`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+export async function fetchLongTermMemory(
+  userId: string,
+): Promise<MemoryItem[]> {
+  return json(
+    await fetch(`/api/users/${encodeURIComponent(userId)}/long-term-memory`),
+  );
+}
+
+export async function putLongTermMemoryItem(
+  userId: string,
+  key: string,
+  value: string,
+): Promise<MemoryItem> {
+  return json(
+    await fetch(
+      `/api/users/${encodeURIComponent(userId)}/long-term-memory/${encodeURIComponent(key)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      },
+    ),
+  );
+}
+
+export async function deleteLongTermMemoryItem(
+  userId: string,
+  key: string,
+): Promise<{ deleted: boolean }> {
+  return json(
+    await fetch(
+      `/api/users/${encodeURIComponent(userId)}/long-term-memory/${encodeURIComponent(key)}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+export async function clearLongTermMemory(
+  userId: string,
+): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(
+      `/api/users/${encodeURIComponent(userId)}/long-term-memory`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
 export async function patchBranch(
   chatId: number,
   branchId: number,

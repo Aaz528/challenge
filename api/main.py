@@ -68,6 +68,16 @@ class SendMessageResponse(BaseModel):
     elapsed_sec: float
 
 
+class MemoryItemOut(BaseModel):
+    key: str
+    value: str
+    updated_at: str
+
+
+class PutMemoryBody(BaseModel):
+    value: str
+
+
 class ForkBody(BaseModel):
     fork_after_message_id: int = Field(..., description="ID сообщения в текущей ветке — история до него включительно копируется")
     title: str = "Новая ветка"
@@ -203,6 +213,144 @@ def get_branch_facts(
     if not b or b.chat_id != chat_id:
         raise HTTPException(status_code=404, detail="Ветка не найдена")
     return storage.get_branch_facts_dict(branch_id)
+
+
+@app.get(
+    "/api/chats/{chat_id}/branches/{branch_id}/working-memory",
+    response_model=list[MemoryItemOut],
+)
+def list_working_memory(
+    chat_id: int,
+    branch_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> list[MemoryItemOut]:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    return [
+        MemoryItemOut(key=r.key, value=r.value, updated_at=r.updated_at)
+        for r in storage.list_working_memory(branch_id)
+    ]
+
+
+@app.put(
+    "/api/chats/{chat_id}/branches/{branch_id}/working-memory/{mem_key}",
+    response_model=MemoryItemOut,
+)
+def put_working_memory_item(
+    chat_id: int,
+    branch_id: int,
+    mem_key: str,
+    body: PutMemoryBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> MemoryItemOut:
+    if not mem_key.strip():
+        raise HTTPException(status_code=400, detail="Пустой ключ")
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    storage.upsert_working_memory(branch_id, mem_key.strip(), body.value)
+    for r in storage.list_working_memory(branch_id):
+        if r.key == mem_key.strip():
+            return MemoryItemOut(key=r.key, value=r.value, updated_at=r.updated_at)
+    raise HTTPException(status_code=500, detail="Не удалось сохранить рабочую память")
+
+
+@app.delete("/api/chats/{chat_id}/branches/{branch_id}/working-memory/{mem_key}")
+def delete_working_memory_item(
+    chat_id: int,
+    branch_id: int,
+    mem_key: str,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> dict[str, bool]:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    deleted = storage.delete_working_memory(branch_id, mem_key.strip())
+    return {"deleted": deleted}
+
+
+@app.delete("/api/chats/{chat_id}/branches/{branch_id}/working-memory")
+def clear_working_memory(
+    chat_id: int,
+    branch_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> dict[str, bool]:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    storage.clear_working_memory(branch_id)
+    return {"ok": True}
+
+
+@app.get("/api/users/{user_id}/long-term-memory", response_model=list[MemoryItemOut])
+def list_long_term_memory(
+    user_id: str,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> list[MemoryItemOut]:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    return [
+        MemoryItemOut(key=r.key, value=r.value, updated_at=r.updated_at)
+        for r in storage.list_long_term_memory(uid)
+    ]
+
+
+@app.put("/api/users/{user_id}/long-term-memory/{mem_key}", response_model=MemoryItemOut)
+def put_long_term_memory_item(
+    user_id: str,
+    mem_key: str,
+    body: PutMemoryBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> MemoryItemOut:
+    uid = user_id.strip()
+    key = mem_key.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    if not key:
+        raise HTTPException(status_code=400, detail="Пустой ключ")
+    storage.upsert_long_term_memory(uid, key, body.value)
+    for r in storage.list_long_term_memory(uid):
+        if r.key == key:
+            return MemoryItemOut(key=r.key, value=r.value, updated_at=r.updated_at)
+    raise HTTPException(status_code=500, detail="Не удалось сохранить долговременную память")
+
+
+@app.delete("/api/users/{user_id}/long-term-memory/{mem_key}")
+def delete_long_term_memory_item(
+    user_id: str,
+    mem_key: str,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> dict[str, bool]:
+    uid = user_id.strip()
+    key = mem_key.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    if not key:
+        raise HTTPException(status_code=400, detail="Пустой ключ")
+    deleted = storage.delete_long_term_memory(uid, key)
+    return {"deleted": deleted}
+
+
+@app.delete("/api/users/{user_id}/long-term-memory")
+def clear_long_term_memory(
+    user_id: str,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> dict[str, bool]:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    storage.clear_long_term_memory(uid)
+    return {"ok": True}
 
 
 @app.post("/api/chats/{chat_id}/branches/{parent_branch_id}/fork", response_model=BranchOut)

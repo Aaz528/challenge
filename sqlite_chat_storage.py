@@ -38,6 +38,13 @@ class MessageRow:
     is_summarized: int
 
 
+@dataclass(frozen=True)
+class MemoryKVRow:
+    key: str
+    value: str
+    updated_at: str
+
+
 class SQLiteChatStorage:
     def __init__(self, db_path: str = "chats.db") -> None:
         self._db_path = Path(db_path)
@@ -140,6 +147,39 @@ class SQLiteChatStorage:
                 FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
             )
             """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS working_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch_id INTEGER NOT NULL,
+                mem_key TEXT NOT NULL,
+                mem_value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (branch_id, mem_key),
+                FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                mem_key TEXT NOT NULL,
+                mem_value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (user_id, mem_key)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_working_memory_branch ON working_memory(branch_id, mem_key)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_long_term_memory_user ON long_term_memory(user_id, mem_key)"
         )
 
         cur.execute("PRAGMA table_info(branches)")
@@ -782,4 +822,114 @@ class SQLiteChatStorage:
             """,
             (delta_tokens, chat_id),
         )
+        self._conn.commit()
+
+    def list_working_memory(self, branch_id: int) -> list[MemoryKVRow]:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT mem_key, mem_value, updated_at
+            FROM working_memory
+            WHERE branch_id=?
+            ORDER BY mem_key ASC
+            """,
+            (branch_id,),
+        )
+        return [
+            MemoryKVRow(
+                key=str(r["mem_key"]),
+                value=str(r["mem_value"]),
+                updated_at=str(r["updated_at"]),
+            )
+            for r in cur.fetchall()
+        ]
+
+    def upsert_working_memory(self, branch_id: int, key: str, value: str) -> None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO working_memory (branch_id, mem_key, mem_value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(branch_id, mem_key)
+            DO UPDATE SET mem_value=excluded.mem_value, updated_at=CURRENT_TIMESTAMP
+            """,
+            (branch_id, key, value),
+        )
+        cur.execute("SELECT chat_id FROM branches WHERE id=?", (branch_id,))
+        row = cur.fetchone()
+        if row:
+            cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(row["chat_id"]),))
+        self._conn.commit()
+
+    def delete_working_memory(self, branch_id: int, key: str) -> bool:
+        cur = self._conn.cursor()
+        cur.execute(
+            "DELETE FROM working_memory WHERE branch_id=? AND mem_key=?",
+            (branch_id, key),
+        )
+        deleted = cur.rowcount > 0
+        if deleted:
+            cur.execute("SELECT chat_id FROM branches WHERE id=?", (branch_id,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(row["chat_id"]),))
+            self._conn.commit()
+        return deleted
+
+    def clear_working_memory(self, branch_id: int) -> None:
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM working_memory WHERE branch_id=?", (branch_id,))
+        cur.execute("SELECT chat_id FROM branches WHERE id=?", (branch_id,))
+        row = cur.fetchone()
+        if row:
+            cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(row["chat_id"]),))
+        self._conn.commit()
+
+    def list_long_term_memory(self, user_id: str) -> list[MemoryKVRow]:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT mem_key, mem_value, updated_at
+            FROM long_term_memory
+            WHERE user_id=?
+            ORDER BY mem_key ASC
+            """,
+            (user_id,),
+        )
+        return [
+            MemoryKVRow(
+                key=str(r["mem_key"]),
+                value=str(r["mem_value"]),
+                updated_at=str(r["updated_at"]),
+            )
+            for r in cur.fetchall()
+        ]
+
+    def upsert_long_term_memory(self, user_id: str, key: str, value: str) -> None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO long_term_memory (user_id, mem_key, mem_value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, mem_key)
+            DO UPDATE SET mem_value=excluded.mem_value, updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, key, value),
+        )
+        self._conn.commit()
+
+    def delete_long_term_memory(self, user_id: str, key: str) -> bool:
+        cur = self._conn.cursor()
+        cur.execute(
+            "DELETE FROM long_term_memory WHERE user_id=? AND mem_key=?",
+            (user_id, key),
+        )
+        deleted = cur.rowcount > 0
+        if deleted:
+            self._conn.commit()
+        return deleted
+
+    def clear_long_term_memory(self, user_id: str) -> None:
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM long_term_memory WHERE user_id=?", (user_id,))
         self._conn.commit()

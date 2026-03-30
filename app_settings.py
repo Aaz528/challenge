@@ -47,11 +47,13 @@ MEMORY_STRATEGY_DEFAULT = "default"
 MEMORY_STRATEGY_SUMMARY = "summary"
 MEMORY_STRATEGY_SLIDING = "sliding_window"
 MEMORY_STRATEGY_STICKY = "sticky_facts"
+MEMORY_STRATEGY_TRIPLE = "triple_memory"
 MEMORY_STRATEGIES = (
     MEMORY_STRATEGY_DEFAULT,
     MEMORY_STRATEGY_SUMMARY,
     MEMORY_STRATEGY_SLIDING,
     MEMORY_STRATEGY_STICKY,
+    MEMORY_STRATEGY_TRIPLE,
 )
 
 
@@ -62,6 +64,10 @@ class MemoryStrategyDefaults:
     sliding_window_messages: int = 20
     # sticky_facts: сколько последних сообщений user+assistant добавлять к facts в промпт
     sticky_tail_messages: int = 12
+    # triple_memory: сколько последних user+assistant сообщений брать в short-term блок.
+    triple_short_tail_messages: int = 12
+    # triple_memory: fallback user_id для long-term памяти, если не задан в strategy_params_json.
+    triple_default_user_id: str = "default_user"
 
 
 MEMORY_DEFAULTS = MemoryStrategyDefaults()

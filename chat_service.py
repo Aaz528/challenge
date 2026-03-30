@@ -10,9 +10,11 @@ from app_settings import (
     MEMORY_STRATEGY_SLIDING,
     MEMORY_STRATEGY_STICKY,
     MEMORY_STRATEGY_SUMMARY,
+    MEMORY_STRATEGY_TRIPLE,
+    SETTINGS,
     SUMMARY_SETTINGS,
 )
-from llm_agent import LLMAgent, LLMConfig
+from llm_agent import LLMAgent, LLMConfig, ToolCallSpec
 from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
 
 
@@ -113,6 +115,113 @@ def build_sticky_context_after_user(
     for r in tail:
         out.append({"role": r.role, "content": r.content})
     return out
+
+
+def _stringify_kv(rows) -> str:
+    if not rows:
+        return "{}"
+    data = {r.key: r.value for r in rows}
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def build_triple_context(
+    storage: SQLiteChatStorage, chat_id: int, branch_id: int, params: dict
+) -> list[dict[str, str]]:
+    b = storage.get_branch(branch_id)
+    if not b:
+        return []
+
+    user_id = str(params.get("user_id", MEMORY_DEFAULTS.triple_default_user_id)).strip()
+    if not user_id:
+        user_id = MEMORY_DEFAULTS.triple_default_user_id
+    tail_n = int(params.get("triple_short_tail_messages", MEMORY_DEFAULTS.triple_short_tail_messages))
+    rows = _ua_rows(storage, chat_id, branch_id)
+    tail = rows[-tail_n:] if tail_n > 0 else rows
+    wm = storage.list_working_memory(branch_id)
+    lm = storage.list_long_term_memory(user_id)
+
+    out: list[dict[str, str]] = [
+        {"role": "system", "content": b.system_prompt},
+        {
+            "role": "system",
+            "content": (
+                "Рабочая память (текущая задача, можно изменять через tools):\n"
+                + _stringify_kv(wm)
+            ),
+        },
+        {
+            "role": "system",
+            "content": (
+                f"Долговременная память пользователя user_id={user_id} (только для чтения):\n"
+                + _stringify_kv(lm)
+            ),
+        },
+    ]
+    for r in tail:
+        out.append({"role": r.role, "content": r.content})
+    return out
+
+
+def _working_memory_tools() -> list[ToolCallSpec]:
+    return [
+        ToolCallSpec(
+            name="wm_list_items",
+            description="Получить текущие данные рабочей памяти задачи.",
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        ToolCallSpec(
+            name="wm_set_item",
+            description="Создать/обновить запись рабочей памяти по ключу.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolCallSpec(
+            name="wm_delete_item",
+            description="Удалить запись рабочей памяти по ключу.",
+            parameters={
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolCallSpec(
+            name="wm_clear",
+            description="Очистить всю рабочую память текущей ветки.",
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+    ]
+
+
+def _execute_working_memory_tool(
+    storage: SQLiteChatStorage, branch_id: int, tool_name: str, args: dict
+) -> dict:
+    if tool_name == "wm_list_items":
+        return {"items": {r.key: r.value for r in storage.list_working_memory(branch_id)}}
+    if tool_name == "wm_set_item":
+        key = str(args.get("key", "")).strip()
+        if not key:
+            return {"ok": False, "error": "key обязателен"}
+        value = str(args.get("value", ""))
+        storage.upsert_working_memory(branch_id, key, value)
+        return {"ok": True}
+    if tool_name == "wm_delete_item":
+        key = str(args.get("key", "")).strip()
+        if not key:
+            return {"ok": False, "error": "key обязателен"}
+        deleted = storage.delete_working_memory(branch_id, key)
+        return {"ok": True, "deleted": deleted}
+    if tool_name == "wm_clear":
+        storage.clear_working_memory(branch_id)
+        return {"ok": True}
+    return {"ok": False, "error": f"неизвестный tool: {tool_name}"}
 
 
 def build_unsummarized_turns(
@@ -238,6 +347,20 @@ def send_message(
         storage.append_message(chat_id, branch_id, "assistant", result.text)
         wm = int(params.get("sliding_window_messages", MEMORY_DEFAULTS.sliding_window_messages))
         storage.delete_old_user_assistant_keep_last(chat_id, branch_id, wm)
+        if result.usage.total_tokens is not None:
+            storage.add_tokens(chat_id, branch_id, result.usage.total_tokens)
+        tok_display = result.usage.total_tokens
+        elapsed = result.elapsed_sec
+    elif strategy == MEMORY_STRATEGY_TRIPLE:
+        ctx = build_triple_context(storage, chat_id, branch_id, params)
+        base_messages: list[dict[str, object]] = [*ctx, {"role": "user", "content": user_text}]
+        result = agent.complete_with_tools(
+            base_messages,
+            tools=_working_memory_tools(),
+            tool_executor=lambda n, a: _execute_working_memory_tool(storage, branch_id, n, a),
+        )
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        storage.append_message(chat_id, branch_id, "assistant", result.text)
         if result.usage.total_tokens is not None:
             storage.add_tokens(chat_id, branch_id, result.usage.total_tokens)
         tok_display = result.usage.total_tokens

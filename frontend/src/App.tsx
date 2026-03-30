@@ -1,24 +1,49 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  clearLongTermMemory,
+  clearWorkingMemory,
   createChat,
+  deleteLongTermMemoryItem,
+  deleteWorkingMemoryItem,
   fetchBranchFacts,
   fetchBranches,
   fetchChats,
+  fetchLongTermMemory,
   fetchMessages,
+  fetchWorkingMemory,
   forkBranch,
   patchBranch,
+  putLongTermMemoryItem,
+  putWorkingMemoryItem,
   sendMessage,
   type Branch,
   type Chat,
+  type MemoryItem,
   type Message,
 } from "./api";
 import "./App.css";
+
+function userIdFromBranch(b: Branch | undefined): string {
+  if (!b) return "default_user";
+  try {
+    const p = JSON.parse(b.strategy_params_json || "{}") as Record<
+      string,
+      unknown
+    >;
+    const u = p.user_id;
+    if (typeof u === "string" && u.trim()) return u.trim();
+  } catch {
+    /* ignore */
+  }
+  return "default_user";
+}
 
 const MEMORY_STRATEGY_OPTIONS = [
   { value: "default", label: "Полная история (без summary)" },
   { value: "summary", label: "Summary + сворачивание" },
   { value: "sliding_window", label: "Скользящее окно (N сообщений)" },
   { value: "sticky_facts", label: "Sticky Facts / KV-память" },
+  { value: "triple_memory", label: "Triple Memory (short/working/long)" },
 ] as const;
 
 export default function App() {
@@ -44,7 +69,29 @@ export default function App() {
   const [editStrategy, setEditStrategy] = useState("summary");
   const [editSlidingN, setEditSlidingN] = useState("20");
   const [editStickyTail, setEditStickyTail] = useState("12");
+  const [editTripleTail, setEditTripleTail] = useState("12");
+  const [editTripleUserId, setEditTripleUserId] = useState("default_user");
   const [factsPreview, setFactsPreview] = useState("");
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
+  const [memoryTab, setMemoryTab] = useState<"working" | "long">("working");
+  const [memorySearch, setMemorySearch] = useState("");
+  const [workingMemoryItems, setWorkingMemoryItems] = useState<MemoryItem[]>(
+    [],
+  );
+  const [longTermItems, setLongTermItems] = useState<MemoryItem[]>([]);
+  const [memoryLtUserId, setMemoryLtUserId] = useState("default_user");
+  const [newWmKey, setNewWmKey] = useState("");
+  const [newWmValue, setNewWmValue] = useState("");
+  const [newLmKey, setNewLmKey] = useState("");
+  const [newLmValue, setNewLmValue] = useState("");
+  const [editTarget, setEditTarget] = useState<
+    { kind: "wm" | "lm"; key: string } | null
+  >(null);
+  const [editValue, setEditValue] = useState("");
+  const [wmLoading, setWmLoading] = useState(false);
+  const [ltLoading, setLtLoading] = useState(false);
+  const [wmError, setWmError] = useState<string | null>(null);
+  const [ltError, setLtError] = useState<string | null>(null);
 
   const loadChats = useCallback(async () => {
     const list = await fetchChats();
@@ -115,14 +162,79 @@ export default function App() {
       }
       const sw = p.sliding_window_messages;
       const st = p.sticky_tail_messages;
+      const tt = p.triple_short_tail_messages;
+      const tu = p.user_id;
       setEditSlidingN(
         typeof sw === "number" && Number.isFinite(sw) ? String(sw) : "20",
       );
       setEditStickyTail(
         typeof st === "number" && Number.isFinite(st) ? String(st) : "12",
       );
+      setEditTripleTail(
+        typeof tt === "number" && Number.isFinite(tt) ? String(tt) : "12",
+      );
+      setEditTripleUserId(typeof tu === "string" && tu.trim() ? tu : "default_user");
     }
   }, [activeBranch, showSettings]);
+
+  useEffect(() => {
+    if (activeBranch) {
+      setMemoryLtUserId(userIdFromBranch(activeBranch));
+    }
+  }, [activeBranch]);
+
+  const loadWorkingMemoryList = useCallback(async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    setWmLoading(true);
+    setWmError(null);
+    try {
+      const list = await fetchWorkingMemory(activeChatId, activeBranchId);
+      setWorkingMemoryItems(list);
+    } catch (e: unknown) {
+      setWorkingMemoryItems([]);
+      setWmError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWmLoading(false);
+    }
+  }, [activeChatId, activeBranchId]);
+
+  const loadLongTermList = useCallback(async () => {
+    const uid = memoryLtUserId.trim() || "default_user";
+    setLtLoading(true);
+    setLtError(null);
+    try {
+      const list = await fetchLongTermMemory(uid);
+      setLongTermItems(list);
+    } catch (e: unknown) {
+      setLongTermItems([]);
+      setLtError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLtLoading(false);
+    }
+  }, [memoryLtUserId]);
+
+  useEffect(() => {
+    if (!showMemoryPanel || activeChatId == null || activeBranchId == null) {
+      return;
+    }
+    void loadWorkingMemoryList();
+  }, [
+    showMemoryPanel,
+    activeChatId,
+    activeBranchId,
+    loadWorkingMemoryList,
+  ]);
+
+  useEffect(() => {
+    if (
+      !showMemoryPanel ||
+      memoryTab !== "long" ||
+      !memoryLtUserId.trim()
+    ) {
+      return;
+    }
+    void loadLongTermList();
+  }, [showMemoryPanel, memoryTab, memoryLtUserId, loadLongTermList]);
 
   useEffect(() => {
     if (!showSettings || activeChatId == null || activeBranchId == null) {
@@ -172,6 +284,10 @@ export default function App() {
       await loadChats();
       const br = await fetchBranches(activeChatId);
       setBranches(br);
+      if (showMemoryPanel) {
+        void loadWorkingMemoryList();
+        if (memoryTab === "long") void loadLongTermList();
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
       setMessages((m) => m.filter((x) => x.id !== optimisticUser.id));
@@ -222,12 +338,22 @@ export default function App() {
     }
   };
 
+  const filterMemoryItems = (items: MemoryItem[]) => {
+    const q = memorySearch.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(
+      (it) =>
+        it.key.toLowerCase().includes(q) ||
+        it.value.toLowerCase().includes(q),
+    );
+  };
+
   const saveBranchSettings = async () => {
     if (activeChatId == null || activeBranchId == null) return;
     setLoading(true);
     setError(null);
     try {
-      const params: Record<string, number> = {};
+      const params: Record<string, number | string> = {};
       if (editStrategy === "sliding_window") {
         const n = parseInt(editSlidingN, 10);
         params.sliding_window_messages =
@@ -237,6 +363,12 @@ export default function App() {
         const n = parseInt(editStickyTail, 10);
         params.sticky_tail_messages =
           Number.isFinite(n) && n > 0 ? n : 12;
+      }
+      if (editStrategy === "triple_memory") {
+        const n = parseInt(editTripleTail, 10);
+        params.triple_short_tail_messages =
+          Number.isFinite(n) && n > 0 ? n : 12;
+        params.user_id = editTripleUserId.trim() || "default_user";
       }
       await patchBranch(activeChatId, activeBranchId, {
         system_prompt: editSp,
@@ -249,6 +381,149 @@ export default function App() {
       const br = await fetchBranches(activeChatId);
       setBranches(br);
       setShowSettings(false);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshMemoryPanel = async () => {
+    try {
+      if (memoryTab === "working") await loadWorkingMemoryList();
+      else await loadLongTermList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleAddWorkingMemory = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    const k = newWmKey.trim();
+    if (!k) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await putWorkingMemoryItem(
+        activeChatId,
+        activeBranchId,
+        k,
+        newWmValue,
+      );
+      setNewWmKey("");
+      setNewWmValue("");
+      await loadWorkingMemoryList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteWorking = async (key: string) => {
+    if (activeChatId == null || activeBranchId == null) return;
+    if (!window.confirm(`Удалить ключ «${key}» из рабочей памяти?`)) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await deleteWorkingMemoryItem(activeChatId, activeBranchId, key);
+      setEditTarget(null);
+      await loadWorkingMemoryList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClearWorking = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    if (!window.confirm("Очистить всю рабочую память этой ветки?")) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await clearWorkingMemory(activeChatId, activeBranchId);
+      setEditTarget(null);
+      await loadWorkingMemoryList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAddLongTerm = async () => {
+    const uid = memoryLtUserId.trim() || "default_user";
+    const k = newLmKey.trim();
+    if (!k) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await putLongTermMemoryItem(uid, k, newLmValue);
+      setNewLmKey("");
+      setNewLmValue("");
+      await loadLongTermList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteLongTerm = async (key: string) => {
+    const uid = memoryLtUserId.trim() || "default_user";
+    if (!window.confirm(`Удалить ключ «${key}» из долговременной памяти?`))
+      return;
+    setLoading(true);
+    setError(null);
+    try {
+      await deleteLongTermMemoryItem(uid, key);
+      setEditTarget(null);
+      await loadLongTermList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClearLongTerm = async () => {
+    const uid = memoryLtUserId.trim() || "default_user";
+    if (!window.confirm(`Очистить всю долговременную память для ${uid}?`))
+      return;
+    setLoading(true);
+    setError(null);
+    try {
+      await clearLongTermMemory(uid);
+      setEditTarget(null);
+      await loadLongTermList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (editTarget == null || activeChatId == null || activeBranchId == null)
+      return;
+    setLoading(true);
+    setError(null);
+    try {
+      if (editTarget.kind === "wm") {
+        await putWorkingMemoryItem(
+          activeChatId,
+          activeBranchId,
+          editTarget.key,
+          editValue,
+        );
+        await loadWorkingMemoryList();
+      } else {
+        const uid = memoryLtUserId.trim() || "default_user";
+        await putLongTermMemoryItem(uid, editTarget.key, editValue);
+        await loadLongTermList();
+      }
+      setEditTarget(null);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -291,7 +566,12 @@ export default function App() {
         {activeChatId == null ? (
           <div className="empty">Выберите чат или создайте новый</div>
         ) : (
-          <>
+          <div
+            className={
+              showMemoryPanel ? "main-wrap main-wrap--split" : "main-wrap"
+            }
+          >
+            <div className="main-chat">
             <div className="toolbar">
               <label>
                 Ветка:{" "}
@@ -315,6 +595,13 @@ export default function App() {
                 onClick={() => setShowSettings((s) => !s)}
               >
                 Настройки ветки
+              </button>
+              <button
+                type="button"
+                className={showMemoryPanel ? "btn primary" : "btn"}
+                onClick={() => setShowMemoryPanel((s) => !s)}
+              >
+                Память
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -342,6 +629,8 @@ export default function App() {
                     "В БД и в промпте остаются только последние N сообщений (user+assistant)."}
                   {editStrategy === "sticky_facts" &&
                     "После каждого сообщения пользователя обновляется блок фактов; в промпт идут факты + хвост диалога."}
+                  {editStrategy === "triple_memory" &&
+                    "Контекст собирается из short-term диалога, working memory ветки и long-term памяти пользователя."}
                 </p>
                 {editStrategy === "sliding_window" && (
                   <label>
@@ -372,6 +661,26 @@ export default function App() {
                         readOnly
                         className="facts-readonly"
                         value={factsPreview}
+                      />
+                    </label>
+                  </>
+                )}
+                {editStrategy === "triple_memory" && (
+                  <>
+                    <label>
+                      Short-term хвост (сообщений user+assistant)
+                      <input
+                        type="number"
+                        min={1}
+                        value={editTripleTail}
+                        onChange={(e) => setEditTripleTail(e.target.value)}
+                      />
+                    </label>
+                    <label>
+                      User ID для long-term памяти
+                      <input
+                        value={editTripleUserId}
+                        onChange={(e) => setEditTripleUserId(e.target.value)}
                       />
                     </label>
                   </>
@@ -474,7 +783,408 @@ export default function App() {
                 Отправить
               </button>
             </div>
-          </>
+            </div>
+            {showMemoryPanel && activeBranchId != null && activeChatId != null && (
+              <aside className="memory-panel" aria-label="Память ветки">
+                <div className="memory-panel-head">
+                  <h2>Память</h2>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={loading}
+                    onClick={() => void refreshMemoryPanel()}
+                  >
+                    Обновить
+                  </button>
+                </div>
+                <div className="memory-tabs" role="tablist">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={memoryTab === "working"}
+                    className={memoryTab === "working" ? "active" : ""}
+                    onClick={() => {
+                      setMemoryTab("working");
+                      setEditTarget(null);
+                      void loadWorkingMemoryList();
+                    }}
+                  >
+                    Рабочая
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={memoryTab === "long"}
+                    className={memoryTab === "long" ? "active" : ""}
+                    onClick={() => {
+                      setMemoryTab("long");
+                      setEditTarget(null);
+                      void loadLongTermList();
+                    }}
+                  >
+                    Долговременная
+                  </button>
+                </div>
+                <div className="memory-panel-body">
+                  <input
+                    type="search"
+                    className="memory-search"
+                    placeholder="Поиск по ключу или значению…"
+                    value={memorySearch}
+                    onChange={(e) => setMemorySearch(e.target.value)}
+                  />
+                  {memoryTab === "working" && (
+                    <>
+                      <p className="memory-hint">
+                        Таблица <code>working_memory</code> для текущей ветки.
+                        Факты стратегии sticky_facts — в настройках ветки.
+                      </p>
+                      {wmLoading && (
+                        <p className="memory-status">Загрузка…</p>
+                      )}
+                      {wmError && (
+                        <div className="memory-err" role="alert">
+                          {wmError}
+                          <br />
+                          <span className="memory-hint">
+                            Убедитесь, что API запущен и прокси /api доступен.
+                          </span>
+                        </div>
+                      )}
+                      {!wmLoading &&
+                        !wmError &&
+                        filterMemoryItems(workingMemoryItems).length === 0 && (
+                          <p className="memory-empty">
+                            Нет записей. Добавьте ниже или используйте стратегию{" "}
+                            <code>triple_memory</code>, чтобы модель могла
+                            менять память через инструменты.
+                          </p>
+                        )}
+                      {!wmLoading &&
+                        filterMemoryItems(workingMemoryItems).length > 0 && (
+                          <div className="memory-json-block">
+                            <strong>Просмотр (JSON)</strong>
+                            <pre className="memory-json-preview">
+                              {JSON.stringify(
+                                Object.fromEntries(
+                                  filterMemoryItems(workingMemoryItems).map(
+                                    (r) => [r.key, r.value],
+                                  ),
+                                ),
+                                null,
+                                2,
+                              )}
+                            </pre>
+                          </div>
+                        )}
+                      <div className="memory-actions">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={loading}
+                          onClick={() => void handleClearWorking()}
+                        >
+                          Очистить всё
+                        </button>
+                      </div>
+                      <div className="memory-table-wrap">
+                        <table className="memory-table">
+                          <thead>
+                            <tr>
+                              <th>Ключ</th>
+                              <th>Значение</th>
+                              <th>Обновлено</th>
+                              <th />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filterMemoryItems(workingMemoryItems).map(
+                              (row) => (
+                                <tr key={row.key}>
+                                  <td className="memory-key">{row.key}</td>
+                                  <td className="memory-val">
+                                    {editTarget?.kind === "wm" &&
+                                    editTarget.key === row.key ? (
+                                      <div className="memory-edit">
+                                        <textarea
+                                          value={editValue}
+                                          onChange={(e) =>
+                                            setEditValue(e.target.value)
+                                          }
+                                        />
+                                        <div className="memory-actions">
+                                          <button
+                                            type="button"
+                                            className="btn primary"
+                                            disabled={loading}
+                                            onClick={() => void handleSaveEdit()}
+                                          >
+                                            Сохранить
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn"
+                                            onClick={() => setEditTarget(null)}
+                                          >
+                                            Отмена
+                                          </button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <span className="memory-val-text">
+                                        {row.value}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="memory-meta">
+                                    {row.updated_at}
+                                  </td>
+                                  <td className="memory-actions">
+                                    <button
+                                      type="button"
+                                      className="btn"
+                                      disabled={
+                                        loading ||
+                                        (editTarget?.kind === "wm" &&
+                                          editTarget.key === row.key)
+                                      }
+                                      onClick={() => {
+                                        setEditTarget({
+                                          kind: "wm",
+                                          key: row.key,
+                                        });
+                                        setEditValue(row.value);
+                                      }}
+                                    >
+                                      Изм.
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn"
+                                      disabled={loading}
+                                      onClick={() =>
+                                        void handleDeleteWorking(row.key)
+                                      }
+                                    >
+                                      Удал.
+                                    </button>
+                                  </td>
+                                </tr>
+                              ),
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                      <details className="memory-add-details">
+                        <summary>Добавить запись</summary>
+                        <div className="memory-add">
+                          <input
+                            placeholder="Ключ"
+                            value={newWmKey}
+                            onChange={(e) => setNewWmKey(e.target.value)}
+                          />
+                          <textarea
+                            placeholder="Значение"
+                            value={newWmValue}
+                            onChange={(e) => setNewWmValue(e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn primary"
+                            disabled={loading || !newWmKey.trim()}
+                            onClick={() => void handleAddWorkingMemory()}
+                          >
+                            Добавить
+                          </button>
+                        </div>
+                      </details>
+                    </>
+                  )}
+                  {memoryTab === "long" && (
+                    <>
+                      <p className="memory-hint">
+                        Долговременная память по <code>user_id</code> (таблица{" "}
+                        <code>long_term_memory</code>). Должна совпадать с{" "}
+                        <code>user_id</code> в параметрах ветки для{" "}
+                        <code>triple_memory</code>.
+                      </p>
+                      <div className="memory-lt-user">
+                        <label>
+                          User ID
+                          <input
+                            value={memoryLtUserId}
+                            onChange={(e) =>
+                              setMemoryLtUserId(e.target.value)
+                            }
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="btn primary"
+                          disabled={loading}
+                          onClick={() => void loadLongTermList()}
+                        >
+                          Загрузить
+                        </button>
+                      </div>
+                      {ltLoading && (
+                        <p className="memory-status">Загрузка…</p>
+                      )}
+                      {ltError && (
+                        <div className="memory-err" role="alert">
+                          {ltError}
+                        </div>
+                      )}
+                      {!ltLoading &&
+                        !ltError &&
+                        filterMemoryItems(longTermItems).length === 0 && (
+                          <p className="memory-empty">
+                            Нет записей для этого user_id.
+                          </p>
+                        )}
+                      {!ltLoading &&
+                        filterMemoryItems(longTermItems).length > 0 && (
+                          <div className="memory-json-block">
+                            <strong>Просмотр (JSON)</strong>
+                            <pre className="memory-json-preview">
+                              {JSON.stringify(
+                                Object.fromEntries(
+                                  filterMemoryItems(longTermItems).map((r) => [
+                                    r.key,
+                                    r.value,
+                                  ]),
+                                ),
+                                null,
+                                2,
+                              )}
+                            </pre>
+                          </div>
+                        )}
+                      <div className="memory-actions">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={loading}
+                          onClick={() => void handleClearLongTerm()}
+                        >
+                          Очистить всё
+                        </button>
+                      </div>
+                      <div className="memory-table-wrap">
+                        <table className="memory-table">
+                          <thead>
+                            <tr>
+                              <th>Ключ</th>
+                              <th>Значение</th>
+                              <th>Обновлено</th>
+                              <th />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filterMemoryItems(longTermItems).map((row) => (
+                              <tr key={row.key}>
+                                <td className="memory-key">{row.key}</td>
+                                <td className="memory-val">
+                                  {editTarget?.kind === "lm" &&
+                                  editTarget.key === row.key ? (
+                                    <div className="memory-edit">
+                                      <textarea
+                                        value={editValue}
+                                        onChange={(e) =>
+                                          setEditValue(e.target.value)
+                                        }
+                                      />
+                                      <div className="memory-actions">
+                                        <button
+                                          type="button"
+                                          className="btn primary"
+                                          disabled={loading}
+                                          onClick={() => void handleSaveEdit()}
+                                        >
+                                          Сохранить
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn"
+                                          onClick={() => setEditTarget(null)}
+                                        >
+                                          Отмена
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <span className="memory-val-text">
+                                      {row.value}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="memory-meta">
+                                  {row.updated_at}
+                                </td>
+                                <td className="memory-actions">
+                                  <button
+                                    type="button"
+                                    className="btn"
+                                    disabled={
+                                      loading ||
+                                      (editTarget?.kind === "lm" &&
+                                        editTarget.key === row.key)
+                                    }
+                                    onClick={() => {
+                                      setEditTarget({
+                                        kind: "lm",
+                                        key: row.key,
+                                      });
+                                      setEditValue(row.value);
+                                    }}
+                                  >
+                                    Изм.
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn"
+                                    disabled={loading}
+                                    onClick={() =>
+                                      void handleDeleteLongTerm(row.key)
+                                    }
+                                  >
+                                    Удал.
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <details className="memory-add-details">
+                        <summary>Добавить запись</summary>
+                        <div className="memory-add">
+                          <input
+                            placeholder="Ключ"
+                            value={newLmKey}
+                            onChange={(e) => setNewLmKey(e.target.value)}
+                          />
+                          <textarea
+                            placeholder="Значение"
+                            value={newLmValue}
+                            onChange={(e) => setNewLmValue(e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn primary"
+                            disabled={loading || !newLmKey.trim()}
+                            onClick={() => void handleAddLongTerm()}
+                          >
+                            Добавить
+                          </button>
+                        </div>
+                      </details>
+                    </>
+                  )}
+                </div>
+              </aside>
+            )}
+          </div>
         )}
         {forkAfterId != null && (
           <div className="modal-backdrop" role="presentation">
