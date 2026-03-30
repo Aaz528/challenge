@@ -6,7 +6,7 @@ from datetime import datetime
 import sys
 
 from app_settings import SETTINGS
-from chat_service import migrate_toon_chats, send_message
+from chat_service import send_message
 from sqlite_chat_storage import SQLiteChatStorage
 
 
@@ -93,7 +93,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         storage = SQLiteChatStorage(db_path=args.db_path)
         storage.ensure_schema()
-        migrate_toon_chats(storage, args.system_prompt)
     except Exception as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 1

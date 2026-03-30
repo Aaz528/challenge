@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 from app_settings import (
     MEMORY_DEFAULTS,
@@ -12,7 +10,6 @@ from app_settings import (
     MEMORY_STRATEGY_SLIDING,
     MEMORY_STRATEGY_STICKY,
     MEMORY_STRATEGY_SUMMARY,
-    SETTINGS,
     SUMMARY_SETTINGS,
 )
 from llm_agent import LLMAgent, LLMConfig
@@ -27,70 +24,6 @@ class SendMessageResult:
     total_tokens_branch: int
     total_tokens_chat: int
     elapsed_sec: float
-
-
-def parse_toon(text: str) -> tuple[list[dict[str, str]], int | None]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "TOON/1":
-        raise ValueError("Неизвестный формат TOON")
-
-    messages: list[dict[str, str]] = []
-    overall_tokens: int | None = None
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        role, payload = line.split("\t", 1)
-        content = base64.b64decode(payload.encode("ascii")).decode("utf-8")
-        if role == "meta":
-            if content.startswith("tokens_total="):
-                try:
-                    overall_tokens = int(content.split("=", 1)[1].strip())
-                except (TypeError, ValueError):
-                    overall_tokens = None
-            continue
-        messages.append({"role": role, "content": content})
-    return messages, overall_tokens
-
-
-def auto_title(file_name: str, messages: list[dict[str, str]]) -> str:
-    lower = file_name.lower()
-    fixed = SETTINGS.fixed_import_titles.get(lower)
-    if fixed:
-        return fixed
-
-    first_user = ""
-    for m in messages:
-        if m.get("role") == "user":
-            first_user = str(m.get("content", "")).strip()
-            break
-    if not first_user:
-        return f"Импорт из {file_name}"
-
-    words = first_user.replace("\n", " ").split()
-    short = " ".join(words[:6]).strip()
-    return short[:80] if short else f"Импорт из {file_name}"
-
-
-def migrate_toon_chats(storage: SQLiteChatStorage, default_system_prompt: str) -> None:
-    for toon_file in sorted(Path.cwd().glob("*.toon")):
-        try:
-            raw = toon_file.read_text(encoding="utf-8")
-            messages, overall_tokens = parse_toon(raw)
-            if not messages:
-                continue
-            system_prompt = default_system_prompt
-            if messages and messages[0].get("role") == "system":
-                system_prompt = str(messages[0].get("content", default_system_prompt))
-            title = auto_title(toon_file.name, messages)
-            storage.get_or_create_chat_from_source(
-                source_key=f"toon:{toon_file.name}",
-                title=title,
-                system_prompt=system_prompt,
-                messages=messages,
-                total_tokens=overall_tokens or 0,
-            )
-        except Exception:
-            continue
 
 
 def normalize_memory_strategy(raw: str | None) -> str:

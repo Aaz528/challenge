@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -22,13 +22,6 @@ class CLISettings:
     default_db_path: str = "chats.db"
     chat_list_limit: int = 20
     exit_commands: tuple[str, ...] = ("exit", "quit", "q", "/exit")
-    # Переопределяем заголовки для уже известных импортов.
-    fixed_import_titles: dict[str, str] = field(
-        default_factory=lambda: {
-            "chat.toon": "Исторический подкаст о Руси",
-            "chat2.toon": "Аналоги Starlink",
-        }
-    )
 
 
 SETTINGS = CLISettings()
