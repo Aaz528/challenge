@@ -162,6 +162,19 @@ def build_triple_context(
     return out
 
 
+def refresh_working_memory_auto(
+    storage: SQLiteChatStorage, agent: LLMAgent, chat_id: int, branch_id: int, params: dict
+) -> tuple[int | None, float]:
+    """После записи user-сообщения. Автообновляет working memory и возвращает (tokens, elapsed)."""
+    tail_n = max(int(params.get("triple_short_tail_messages", MEMORY_DEFAULTS.triple_short_tail_messages)), 6)
+    rows = _ua_rows(storage, chat_id, branch_id)
+    snippet = "\n".join(f"{r.role.upper()}: {r.content}" for r in rows[-tail_n:])
+    existing = storage.get_working_memory_dict(branch_id)
+    merged, merge_res = agent.merge_working_memory(existing, snippet)
+    storage.replace_working_memory(branch_id, merged)
+    return merge_res.usage.total_tokens, merge_res.elapsed_sec
+
+
 def _working_memory_tools() -> list[ToolCallSpec]:
     return [
         ToolCallSpec(
@@ -352,19 +365,26 @@ def send_message(
         tok_display = result.usage.total_tokens
         elapsed = result.elapsed_sec
     elif strategy == MEMORY_STRATEGY_TRIPLE:
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        tok_m, el_m = refresh_working_memory_auto(storage, agent, chat_id, branch_id, params)
+        tokens_merge = tok_m
+        elapsed_merge = el_m
         ctx = build_triple_context(storage, chat_id, branch_id, params)
-        base_messages: list[dict[str, object]] = [*ctx, {"role": "user", "content": user_text}]
         result = agent.complete_with_tools(
-            base_messages,
+            ctx,
             tools=_working_memory_tools(),
             tool_executor=lambda n, a: _execute_working_memory_tool(storage, branch_id, n, a),
         )
-        storage.append_message(chat_id, branch_id, "user", user_text)
         storage.append_message(chat_id, branch_id, "assistant", result.text)
+        total_llm_tokens = 0
+        if tokens_merge is not None:
+            total_llm_tokens += tokens_merge
         if result.usage.total_tokens is not None:
-            storage.add_tokens(chat_id, branch_id, result.usage.total_tokens)
-        tok_display = result.usage.total_tokens
-        elapsed = result.elapsed_sec
+            total_llm_tokens += result.usage.total_tokens
+        if total_llm_tokens > 0:
+            storage.add_tokens(chat_id, branch_id, total_llm_tokens)
+        tok_display = total_llm_tokens if total_llm_tokens > 0 else result.usage.total_tokens
+        elapsed = elapsed_merge + result.elapsed_sec
     else:
         ctx = storage.get_context_messages(branch_id)
         result = agent.chat_turn_with_messages(ctx, user_text)

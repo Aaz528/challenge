@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app_settings import MEMORY_STRATEGIES, SETTINGS, WEB_SETTINGS
+from app_settings import MEMORY_PROFILE_PRESETS, MEMORY_STRATEGIES, SETTINGS, WEB_SETTINGS
 from chat_service import send_message
 from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
 
@@ -78,6 +78,13 @@ class PutMemoryBody(BaseModel):
     value: str
 
 
+class MemoryProfileOut(BaseModel):
+    id: str
+    title: str
+    description: str
+    user_id: str
+
+
 class ForkBody(BaseModel):
     fork_after_message_id: int = Field(..., description="ID сообщения в текущей ветке — история до него включительно копируется")
     title: str = "Новая ветка"
@@ -140,6 +147,20 @@ def _branch_out(b: BranchInfo) -> BranchOut:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/memory-profiles", response_model=list[MemoryProfileOut])
+def get_memory_profiles() -> list[MemoryProfileOut]:
+    return [
+        MemoryProfileOut(
+            id=str(p.get("id", "")),
+            title=str(p.get("title", "")),
+            description=str(p.get("description", "")),
+            user_id=str(p.get("id", "")),
+        )
+        for p in MEMORY_PROFILE_PRESETS
+        if str(p.get("id", "")).strip()
+    ]
 
 
 @app.get("/api/chats", response_model=list[ChatOut])

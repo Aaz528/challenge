@@ -159,6 +159,31 @@ class LLMAgent:
         )
         return _parse_json_object(res.text), res
 
+    def merge_working_memory(self, existing: dict[str, str], dialogue_snippet: str) -> tuple[dict[str, str], AgentResult]:
+        """Автоматически обновляет рабочую память текущей задачи (JSON key-value)."""
+        prompt = (
+            "Ты обновляешь рабочую память задачи в виде JSON-объекта (строковые ключи и значения).\n"
+            "Назначение: хранить только краткоживущие данные текущей задачи.\n"
+            "Рекомендуемые ключи: task_goal, current_plan, next_step, done_items, open_questions, constraints.\n"
+            "Правила:\n"
+            "1) Коротко и по делу.\n"
+            "2) Обновляй существующие значения при изменении.\n"
+            "3) Удаляй устаревшие ключи.\n"
+            "4) Не копируй весь диалог.\n"
+            "5) Верни ТОЛЬКО валидный JSON-объект без markdown.\n\n"
+            f"Текущая рабочая память:\n{json.dumps(existing, ensure_ascii=False)}\n\n"
+            f"Новый фрагмент диалога:\n{dialogue_snippet}\n"
+        )
+        res = self._complete(
+            messages=[
+                {"role": "system", "content": "Ты помощник для рабочей памяти задач."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1400,
+        )
+        return _parse_json_object(res.text), res
+
     def complete_with_tools(
         self,
         messages: list[dict[str, Any]],

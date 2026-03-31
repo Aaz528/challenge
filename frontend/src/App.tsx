@@ -9,6 +9,7 @@ import {
   fetchBranches,
   fetchChats,
   fetchLongTermMemory,
+  fetchMemoryProfiles,
   fetchMessages,
   fetchWorkingMemory,
   forkBranch,
@@ -19,12 +20,15 @@ import {
   type Branch,
   type Chat,
   type MemoryItem,
+  type MemoryProfile,
   type Message,
 } from "./api";
 import "./App.css";
 
+const DEFAULT_PROFILE_USER_ID = "profile_starter";
+
 function userIdFromBranch(b: Branch | undefined): string {
-  if (!b) return "default_user";
+  if (!b) return DEFAULT_PROFILE_USER_ID;
   try {
     const p = JSON.parse(b.strategy_params_json || "{}") as Record<
       string,
@@ -35,7 +39,16 @@ function userIdFromBranch(b: Branch | undefined): string {
   } catch {
     /* ignore */
   }
-  return "default_user";
+  return DEFAULT_PROFILE_USER_ID;
+}
+
+function profileChoiceFromUserId(
+  profiles: MemoryProfile[],
+  userId: string,
+): string {
+  const uid = userId.trim();
+  const found = profiles.find((p) => p.user_id === uid);
+  return found ? found.id : "custom";
 }
 
 const MEMORY_STRATEGY_OPTIONS = [
@@ -70,7 +83,9 @@ export default function App() {
   const [editSlidingN, setEditSlidingN] = useState("20");
   const [editStickyTail, setEditStickyTail] = useState("12");
   const [editTripleTail, setEditTripleTail] = useState("12");
-  const [editTripleUserId, setEditTripleUserId] = useState("default_user");
+  const [editTripleUserId, setEditTripleUserId] = useState(
+    DEFAULT_PROFILE_USER_ID,
+  );
   const [factsPreview, setFactsPreview] = useState("");
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
   const [memoryTab, setMemoryTab] = useState<"working" | "long">("working");
@@ -79,7 +94,9 @@ export default function App() {
     [],
   );
   const [longTermItems, setLongTermItems] = useState<MemoryItem[]>([]);
-  const [memoryLtUserId, setMemoryLtUserId] = useState("default_user");
+  const [memoryLtUserId, setMemoryLtUserId] = useState(
+    DEFAULT_PROFILE_USER_ID,
+  );
   const [newWmKey, setNewWmKey] = useState("");
   const [newWmValue, setNewWmValue] = useState("");
   const [newLmKey, setNewLmKey] = useState("");
@@ -92,6 +109,9 @@ export default function App() {
   const [ltLoading, setLtLoading] = useState(false);
   const [wmError, setWmError] = useState<string | null>(null);
   const [ltError, setLtError] = useState<string | null>(null);
+  const [memoryProfiles, setMemoryProfiles] = useState<MemoryProfile[]>([]);
+  const [tripleProfileChoice, setTripleProfileChoice] = useState("custom");
+  const [ltProfileChoice, setLtProfileChoice] = useState("custom");
 
   const loadChats = useCallback(async () => {
     const list = await fetchChats();
@@ -104,6 +124,12 @@ export default function App() {
       setError(e instanceof Error ? e.message : String(e)),
     );
   }, [loadChats]);
+
+  useEffect(() => {
+    void fetchMemoryProfiles()
+      .then((items) => setMemoryProfiles(items))
+      .catch(() => setMemoryProfiles([]));
+  }, []);
 
   const loadBranchesForChat = useCallback(async (chatId: number) => {
     const list = await fetchBranches(chatId);
@@ -173,15 +199,22 @@ export default function App() {
       setEditTripleTail(
         typeof tt === "number" && Number.isFinite(tt) ? String(tt) : "12",
       );
-      setEditTripleUserId(typeof tu === "string" && tu.trim() ? tu : "default_user");
+      const uid =
+        typeof tu === "string" && tu.trim()
+          ? tu
+          : DEFAULT_PROFILE_USER_ID;
+      setEditTripleUserId(uid);
+      setTripleProfileChoice(profileChoiceFromUserId(memoryProfiles, uid));
     }
-  }, [activeBranch, showSettings]);
+  }, [activeBranch, showSettings, memoryProfiles]);
 
   useEffect(() => {
     if (activeBranch) {
-      setMemoryLtUserId(userIdFromBranch(activeBranch));
+      const uid = userIdFromBranch(activeBranch);
+      setMemoryLtUserId(uid);
+      setLtProfileChoice(profileChoiceFromUserId(memoryProfiles, uid));
     }
-  }, [activeBranch]);
+  }, [activeBranch, memoryProfiles]);
 
   const loadWorkingMemoryList = useCallback(async () => {
     if (activeChatId == null || activeBranchId == null) return;
@@ -199,7 +232,7 @@ export default function App() {
   }, [activeChatId, activeBranchId]);
 
   const loadLongTermList = useCallback(async () => {
-    const uid = memoryLtUserId.trim() || "default_user";
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
     setLtLoading(true);
     setLtError(null);
     try {
@@ -348,6 +381,35 @@ export default function App() {
     );
   };
 
+  const detectValueType = (raw: string) => {
+    const t = raw.trim();
+    if (!t) return "empty";
+    if (t === "true" || t === "false") return "boolean";
+    if (!Number.isNaN(Number(t)) && t !== "") return "number";
+    try {
+      const parsed: unknown = JSON.parse(t);
+      if (parsed !== null && typeof parsed === "object") return "json";
+    } catch {
+      /* ignore */
+    }
+    return "text";
+  };
+
+  const getTypeStats = (items: MemoryItem[]) => {
+    const counts: Record<string, number> = {
+      text: 0,
+      number: 0,
+      boolean: 0,
+      json: 0,
+      empty: 0,
+    };
+    for (const it of items) {
+      const kind = detectValueType(it.value);
+      counts[kind] = (counts[kind] ?? 0) + 1;
+    }
+    return counts;
+  };
+
   const saveBranchSettings = async () => {
     if (activeChatId == null || activeBranchId == null) return;
     setLoading(true);
@@ -368,7 +430,7 @@ export default function App() {
         const n = parseInt(editTripleTail, 10);
         params.triple_short_tail_messages =
           Number.isFinite(n) && n > 0 ? n : 12;
-        params.user_id = editTripleUserId.trim() || "default_user";
+        params.user_id = editTripleUserId.trim() || DEFAULT_PROFILE_USER_ID;
       }
       await patchBranch(activeChatId, activeBranchId, {
         system_prompt: editSp,
@@ -453,7 +515,7 @@ export default function App() {
   };
 
   const handleAddLongTerm = async () => {
-    const uid = memoryLtUserId.trim() || "default_user";
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
     const k = newLmKey.trim();
     if (!k) return;
     setLoading(true);
@@ -471,7 +533,7 @@ export default function App() {
   };
 
   const handleDeleteLongTerm = async (key: string) => {
-    const uid = memoryLtUserId.trim() || "default_user";
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
     if (!window.confirm(`Удалить ключ «${key}» из долговременной памяти?`))
       return;
     setLoading(true);
@@ -488,7 +550,7 @@ export default function App() {
   };
 
   const handleClearLongTerm = async () => {
-    const uid = memoryLtUserId.trim() || "default_user";
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
     if (!window.confirm(`Очистить всю долговременную память для ${uid}?`))
       return;
     setLoading(true);
@@ -519,7 +581,7 @@ export default function App() {
         );
         await loadWorkingMemoryList();
       } else {
-        const uid = memoryLtUserId.trim() || "default_user";
+        const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
         await putLongTermMemoryItem(uid, editTarget.key, editValue);
         await loadLongTermList();
       }
@@ -530,6 +592,11 @@ export default function App() {
       setLoading(false);
     }
   };
+
+  const currentMemoryItems =
+    memoryTab === "working" ? workingMemoryItems : longTermItems;
+  const filteredMemoryItems = filterMemoryItems(currentMemoryItems);
+  const memoryTypeStats = getTypeStats(currentMemoryItems);
 
   return (
     <div className="layout">
@@ -677,12 +744,33 @@ export default function App() {
                       />
                     </label>
                     <label>
-                      User ID для long-term памяти
-                      <input
-                        value={editTripleUserId}
-                        onChange={(e) => setEditTripleUserId(e.target.value)}
-                      />
+                      Профиль long-term памяти
+                      <select
+                        value={tripleProfileChoice}
+                        onChange={(e) => {
+                          const choice = e.target.value;
+                          setTripleProfileChoice(choice);
+                          const picked = memoryProfiles.find((p) => p.id === choice);
+                          if (picked) setEditTripleUserId(picked.user_id);
+                        }}
+                      >
+                        {memoryProfiles.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.title}
+                          </option>
+                        ))}
+                        <option value="custom">Пользовательский (manual)</option>
+                      </select>
                     </label>
+                    {tripleProfileChoice === "custom" && (
+                      <label>
+                        User ID (manual)
+                        <input
+                          value={editTripleUserId}
+                          onChange={(e) => setEditTripleUserId(e.target.value)}
+                        />
+                      </label>
+                    )}
                   </>
                 )}
                 <label>
@@ -833,6 +921,24 @@ export default function App() {
                     value={memorySearch}
                     onChange={(e) => setMemorySearch(e.target.value)}
                   />
+                  <div className="memory-stats">
+                    <div className="memory-stats-row">
+                      <span>Всего записей:</span>
+                      <strong>{currentMemoryItems.length}</strong>
+                    </div>
+                    <div className="memory-stats-row">
+                      <span>Показано по фильтру:</span>
+                      <strong>{filteredMemoryItems.length}</strong>
+                    </div>
+                    <div className="memory-stats-types">
+                      <span>Типы:</span>
+                      <span className="chip">text: {memoryTypeStats.text}</span>
+                      <span className="chip">number: {memoryTypeStats.number}</span>
+                      <span className="chip">boolean: {memoryTypeStats.boolean}</span>
+                      <span className="chip">json: {memoryTypeStats.json}</span>
+                      <span className="chip">empty: {memoryTypeStats.empty}</span>
+                    </div>
+                  </div>
                   {memoryTab === "working" && (
                     <>
                       <p className="memory-hint">
@@ -1010,14 +1116,35 @@ export default function App() {
                       </p>
                       <div className="memory-lt-user">
                         <label>
-                          User ID
-                          <input
-                            value={memoryLtUserId}
-                            onChange={(e) =>
-                              setMemoryLtUserId(e.target.value)
-                            }
-                          />
+                          Профиль
+                          <select
+                            value={ltProfileChoice}
+                            onChange={(e) => {
+                              const choice = e.target.value;
+                              setLtProfileChoice(choice);
+                              const picked = memoryProfiles.find((p) => p.id === choice);
+                              if (picked) setMemoryLtUserId(picked.user_id);
+                            }}
+                          >
+                            {memoryProfiles.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.title}
+                              </option>
+                            ))}
+                            <option value="custom">Пользовательский (manual)</option>
+                          </select>
                         </label>
+                        {ltProfileChoice === "custom" && (
+                          <label>
+                            User ID (manual)
+                            <input
+                              value={memoryLtUserId}
+                              onChange={(e) =>
+                                setMemoryLtUserId(e.target.value)
+                              }
+                            />
+                          </label>
+                        )}
                         <button
                           type="button"
                           className="btn primary"

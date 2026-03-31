@@ -67,8 +67,46 @@ class MemoryStrategyDefaults:
     # triple_memory: сколько последних user+assistant сообщений брать в short-term блок.
     triple_short_tail_messages: int = 12
     # triple_memory: fallback user_id для long-term памяти, если не задан в strategy_params_json.
-    triple_default_user_id: str = "default_user"
+    triple_default_user_id: str = "profile_starter"
 
 
 MEMORY_DEFAULTS = MemoryStrategyDefaults()
+
+
+MEMORY_PROFILE_PRESETS = (
+    {
+        "id": "profile_basic",
+        "title": "Базовый",
+        "description": "Базовый универсальный профиль общения и предпочтений.",
+        "entries": {
+            "name": "User",
+            "language": "ru",
+            "answer_style": "кратко и структурированно",
+            "role": "software engineer",
+            "main_stack": "python, fastapi, react",
+            "project_context": "локальный AI-ассистент с ветками и памятью",
+            "priorities": "надежность, поддерживаемость, ясность",
+            "constraints": "без усложнения инфраструктуры",
+            "testing_preferences": "smoke + сборка + базовые проверки",
+            "delivery_format": "короткий итог + детали + next steps",
+        },
+    },
+    {
+        "id": "profile_starter",
+        "title": "Стартовый",
+        "description": "Стартовый профиль для быстрого начала работы.",
+        "entries": {
+            "name": "Nout",
+            "language": "ru",
+            "answer_style": "кратко, по делу, с конкретными шагами",
+            "role": "fullstack developer",
+            "main_stack": "python, fastapi, react, sqlite",
+            "project_context": "локальный AI-ассистент с ветками чатов и многоуровневой памятью",
+            "priorities": "надежность и простота поддержки",
+            "constraints": "минимум сложной инфраструктуры, локальный запуск",
+            "testing_preferences": "быстрые smoke + сборка фронта + py_compile",
+            "delivery_format": "сначала итог, потом детали и что проверить",
+        },
+    },
+)
 

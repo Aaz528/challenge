@@ -291,6 +291,37 @@
   font-size: 0.85rem;
 }
 
+.memory-stats {
+  border: 1px solid #3a3f4b;
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  background: #23262f;
+  font-size: 0.8rem;
+}
+
+.memory-stats-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.memory-stats-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+.chip {
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid #3a3f4b;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  background: #2c313c;
+}
+
 .memory-table-wrap {
   overflow-x: auto;
   border: 1px solid #3a3f4b;
@@ -466,7 +497,8 @@
   font-size: 0.8rem;
 }
 
-.memory-lt-user input {
+.memory-lt-user input,
+.memory-lt-user select {
   width: 100%;
   margin-top: 0.2rem;
   padding: 0.35rem 0.5rem;

@@ -122,6 +122,17 @@ export type MemoryItem = {
   updated_at: string;
 };
 
+export type MemoryProfile = {
+  id: string;
+  title: string;
+  description: string;
+  user_id: string;
+};
+
+export async function fetchMemoryProfiles(): Promise<MemoryProfile[]> {
+  return json(await fetch("/api/memory-profiles"));
+}
+
 export async function fetchWorkingMemory(
   chatId: number,
   branchId: number,

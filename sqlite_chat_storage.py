@@ -4,7 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_settings import MEMORY_STRATEGY_SUMMARY, SETTINGS
+from app_settings import MEMORY_PROFILE_PRESETS, MEMORY_STRATEGY_SUMMARY, SETTINGS
 
 
 @dataclass(frozen=True)
@@ -194,6 +194,7 @@ class SQLiteChatStorage:
             )
 
         self._migrate_branches_data(cur)
+        self._seed_memory_profiles(cur)
         self._conn.commit()
 
     def _migrate_branches_data(self, cur: sqlite3.Cursor) -> None:
@@ -251,6 +252,23 @@ class SQLiteChatStorage:
             WHERE branch_id IS NULL
             """
         )
+
+    def _seed_memory_profiles(self, cur: sqlite3.Cursor) -> None:
+        for p in MEMORY_PROFILE_PRESETS:
+            uid = str(p.get("id", "")).strip()
+            if not uid:
+                continue
+            entries = p.get("entries", {})
+            if not isinstance(entries, dict):
+                continue
+            for k, v in entries.items():
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO long_term_memory (user_id, mem_key, mem_value)
+                    VALUES (?, ?, ?)
+                    """,
+                    (uid, str(k), str(v)),
+                )
 
     def get_main_branch_id(self, chat_id: int) -> int | None:
         cur = self._conn.cursor()
@@ -860,6 +878,15 @@ class SQLiteChatStorage:
         if row:
             cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(row["chat_id"]),))
         self._conn.commit()
+
+    def get_working_memory_dict(self, branch_id: int) -> dict[str, str]:
+        rows = self.list_working_memory(branch_id)
+        return {r.key: r.value for r in rows}
+
+    def replace_working_memory(self, branch_id: int, memory: dict[str, str]) -> None:
+        self.clear_working_memory(branch_id)
+        for k, v in memory.items():
+            self.upsert_working_memory(branch_id, str(k), str(v))
 
     def delete_working_memory(self, branch_id: int, key: str) -> bool:
         cur = self._conn.cursor()
