@@ -5,7 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import requests
 from dotenv import load_dotenv
@@ -50,6 +50,15 @@ class ToolCallSpec:
     name: str
     description: str
     parameters: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    type: str
+    delta: str | None = None
+    result: AgentResult | None = None
+    error: str | None = None
+    stopped: bool = False
 
 
 @dataclass
@@ -140,6 +149,90 @@ class LLMAgent:
             raise ValueError("Пустой список сообщений.")
         return self._complete(messages, temperature=self._temperature, max_tokens=self._max_tokens)
 
+    def complete_messages_stream_events(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Iterator[StreamEvent]:
+        """Стримит ответ: последовательность delta-событий и финальный done с AgentResult."""
+        if not messages:
+            raise ValueError("Пустой список сообщений.")
+
+        if not self._config.api_key:
+            raise RuntimeError("OPENAI_API_KEY не задан в .env")
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": messages,
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": "application/json",
+        }
+        t0 = time.perf_counter()
+        text_parts: list[str] = []
+        model_name = self._config.model
+        usage: LLMUsage = LLMUsage(total_tokens=None, prompt_tokens=None, completion_tokens=None)
+
+        with requests.post(
+            f"{self._config.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=self._timeout_sec,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if should_stop is not None and should_stop():
+                    break
+                if not raw_line:
+                    continue
+                line = str(raw_line).strip()
+                if not line.startswith("data:"):
+                    continue
+                data_part = line[len("data:") :].strip()
+                if data_part == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_part)
+                except json.JSONDecodeError:
+                    continue
+                model_name = str(chunk.get("model") or model_name)
+                if isinstance(chunk.get("usage"), dict):
+                    usage = self._parse_usage(chunk.get("usage"))
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                msg = choices[0].get("delta", {})
+                if not isinstance(msg, dict):
+                    continue
+                delta = msg.get("content")
+                if delta is None:
+                    continue
+                d = str(delta)
+                if not d:
+                    continue
+                text_parts.append(d)
+                yield StreamEvent(type="delta", delta=d)
+
+        elapsed = time.perf_counter() - t0
+        final_text = "".join(text_parts).strip()
+        yield StreamEvent(
+            type="done",
+            result=AgentResult(
+                text=final_text,
+                model=model_name,
+                usage=usage,
+                elapsed_sec=elapsed,
+                raw=None,
+            ),
+            stopped=bool(should_stop is not None and should_stop()),
+        )
+
     def merge_sticky_facts(self, existing: dict[str, str], dialogue_snippet: str) -> tuple[dict[str, str], AgentResult]:
         """Обновляет key-value факты по фрагменту диалога. Отдельный вызов LLM с низкой температурой."""
         prompt = (
@@ -164,7 +257,7 @@ class LLMAgent:
         prompt = (
             "Ты обновляешь рабочую память задачи в виде JSON-объекта (строковые ключи и значения).\n"
             "Назначение: хранить только краткоживущие данные текущей задачи.\n"
-            "Рекомендуемые ключи: task_goal, current_plan, next_step, done_items, open_questions, constraints.\n"
+            "Рекомендуемые ключи: task_goal, current_plan, next_step, done_items, open_questions, constraints, task_fsm.\n"
             "Правила:\n"
             "1) Коротко и по делу.\n"
             "2) Обновляй существующие значения при изменении.\n"
@@ -282,6 +375,187 @@ class LLMAgent:
                 )
 
         raise RuntimeError("Не удалось завершить tool-calling за разумное число шагов.")
+
+    def complete_with_tools_stream_events(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[ToolCallSpec],
+        tool_executor,
+        max_rounds: int = 4,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Iterator[StreamEvent]:
+        """
+        Потоковый function-calling.
+        Внутри раунда дельты буферизуются и отдаются, только если раунд завершился без tool_calls.
+        """
+        if not messages:
+            raise ValueError("Пустой список сообщений.")
+
+        if not self._config.api_key:
+            raise RuntimeError("OPENAI_API_KEY не задан в .env")
+
+        msg: list[dict[str, Any]] = [dict(m) for m in messages]
+        tool_defs = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in tools
+        ]
+        total_prompt = 0
+        total_completion = 0
+        total_tokens = 0
+        elapsed_total = 0.0
+        model_name = self._config.model
+
+        for _ in range(max_rounds):
+            if should_stop is not None and should_stop():
+                break
+            payload: dict[str, Any] = {
+                "model": self._config.model,
+                "messages": msg,
+                "temperature": self._temperature,
+                "max_tokens": self._max_tokens,
+                "tools": tool_defs,
+                "tool_choice": "auto",
+                "stream": True,
+            }
+            headers = {
+                "Authorization": f"Bearer {self._config.api_key}",
+                "Content-Type": "application/json",
+            }
+            round_deltas: list[str] = []
+            round_content = ""
+            tool_calls_by_index: dict[int, dict[str, Any]] = {}
+            round_usage: LLMUsage = LLMUsage(None, None, None)
+            t0 = time.perf_counter()
+            with requests.post(
+                f"{self._config.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=self._timeout_sec,
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if should_stop is not None and should_stop():
+                        break
+                    if not raw_line:
+                        continue
+                    line = str(raw_line).strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_part = line[len("data:") :].strip()
+                    if data_part == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_part)
+                    except json.JSONDecodeError:
+                        continue
+                    model_name = str(chunk.get("model") or model_name)
+                    if isinstance(chunk.get("usage"), dict):
+                        round_usage = self._parse_usage(chunk.get("usage"))
+                    choices = chunk.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    if not isinstance(delta, dict):
+                        continue
+                    content_delta = delta.get("content")
+                    if content_delta is not None:
+                        d = str(content_delta)
+                        if d:
+                            round_deltas.append(d)
+                            round_content += d
+                    tc_delta = delta.get("tool_calls")
+                    if isinstance(tc_delta, list):
+                        for item in tc_delta:
+                            if not isinstance(item, dict):
+                                continue
+                            idx = int(item.get("index", 0))
+                            cur = tool_calls_by_index.setdefault(
+                                idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                            )
+                            if item.get("id"):
+                                cur["id"] = str(item.get("id"))
+                            fn = item.get("function")
+                            if isinstance(fn, dict):
+                                if fn.get("name"):
+                                    cur["function"]["name"] += str(fn.get("name"))
+                                if fn.get("arguments"):
+                                    cur["function"]["arguments"] += str(fn.get("arguments"))
+
+            elapsed_total += time.perf_counter() - t0
+            if round_usage.prompt_tokens is not None:
+                total_prompt += round_usage.prompt_tokens
+            if round_usage.completion_tokens is not None:
+                total_completion += round_usage.completion_tokens
+            if round_usage.total_tokens is not None:
+                total_tokens += round_usage.total_tokens
+
+            if should_stop is not None and should_stop():
+                break
+
+            if tool_calls_by_index:
+                tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index.keys())]
+                msg.append({"role": "assistant", "content": round_content, "tool_calls": tool_calls})
+                for tc in tool_calls:
+                    tc_id = str(tc.get("id", ""))
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    fn_name = str(fn.get("name", "")).strip()
+                    raw_args = str(fn.get("arguments", "{}"))
+                    try:
+                        parsed_args = json.loads(raw_args) if raw_args.strip() else {}
+                    except json.JSONDecodeError:
+                        parsed_args = {}
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {}
+                    tool_result = tool_executor(fn_name, parsed_args)
+                    if not isinstance(tool_result, str):
+                        tool_result = json.dumps(tool_result, ensure_ascii=False)
+                    msg.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+                continue
+
+            final_text = "".join(round_deltas).strip()
+            for d in round_deltas:
+                yield StreamEvent(type="delta", delta=d)
+            yield StreamEvent(
+                type="done",
+                result=AgentResult(
+                    text=final_text,
+                    model=model_name,
+                    usage=LLMUsage(
+                        total_tokens=total_tokens or None,
+                        prompt_tokens=total_prompt or None,
+                        completion_tokens=total_completion or None,
+                    ),
+                    elapsed_sec=elapsed_total,
+                    raw=None,
+                ),
+                stopped=False,
+            )
+            return
+
+        yield StreamEvent(
+            type="done",
+            result=AgentResult(
+                text="",
+                model=model_name,
+                usage=LLMUsage(
+                    total_tokens=total_tokens or None,
+                    prompt_tokens=total_prompt or None,
+                    completion_tokens=total_completion or None,
+                ),
+                elapsed_sec=elapsed_total,
+                raw=None,
+            ),
+            stopped=bool(should_stop is not None and should_stop()),
+        )
 
     def chat_turn(self, conversation: ConversationState, user_query: str) -> AgentResult:
         """

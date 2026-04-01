@@ -254,6 +254,19 @@
   padding: 0.5rem 0.75rem 0;
 }
 
+.memory-fsm {
+  margin: 0.5rem 0.75rem 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #3a3f4b;
+  border-radius: 8px;
+  background: #252830;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
 .memory-tabs button {
   padding: 0.35rem 0.65rem;
   font-size: 0.85rem;
@@ -572,8 +585,37 @@
   padding: 1rem;
   border-top: 1px solid #3a3f4b;
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   align-items: flex-end;
+}
+
+.stream-progress {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.stream-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.stream-step {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #3a3f4b;
+  border-radius: 999px;
+  background: #252830;
+  opacity: 0.75;
+}
+
+.stream-step.active {
+  opacity: 1;
+  border-color: #3d6fd1;
+  background: #2a3650;
 }
 
 .composer textarea {

@@ -28,6 +28,38 @@ class SendMessageResult:
     elapsed_sec: float
 
 
+TASK_FSM_KEY = "task_fsm"
+TASK_STAGE_PLANNING = "planning"
+TASK_STAGE_EXECUTION = "execution"
+TASK_STAGE_VALIDATION = "validation"
+TASK_STAGE_DONE = "done"
+TASK_STAGE_PAUSED = "paused"
+TASK_STAGES = (
+    TASK_STAGE_PLANNING,
+    TASK_STAGE_EXECUTION,
+    TASK_STAGE_VALIDATION,
+    TASK_STAGE_DONE,
+    TASK_STAGE_PAUSED,
+)
+
+TASK_STAGE_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    TASK_STAGE_PLANNING: (TASK_STAGE_EXECUTION, TASK_STAGE_PAUSED),
+    TASK_STAGE_EXECUTION: (TASK_STAGE_VALIDATION, TASK_STAGE_PAUSED),
+    TASK_STAGE_VALIDATION: (TASK_STAGE_DONE, TASK_STAGE_PAUSED),
+    TASK_STAGE_DONE: tuple(),
+    TASK_STAGE_PAUSED: tuple(),  # handled via resume (previous stage)
+}
+
+
+@dataclass(frozen=True)
+class TaskFSMState:
+    stage: str
+    current_step: str
+    expected_action: str
+    previous_stage: str | None = None
+    pause_reason: str | None = None
+
+
 def normalize_memory_strategy(raw: str | None) -> str:
     s = (raw or MEMORY_STRATEGY_SUMMARY).strip().lower()
     if s not in MEMORY_STRATEGIES:
@@ -122,6 +154,124 @@ def _stringify_kv(rows) -> str:
         return "{}"
     data = {r.key: r.value for r in rows}
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _task_fsm_to_json(state: TaskFSMState) -> str:
+    payload: dict[str, str] = {
+        "stage": state.stage,
+        "current_step": state.current_step,
+        "expected_action": state.expected_action,
+    }
+    if state.previous_stage:
+        payload["previous_stage"] = state.previous_stage
+    if state.pause_reason:
+        payload["pause_reason"] = state.pause_reason
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _parse_task_fsm(raw: str | None) -> TaskFSMState | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    stage = str(data.get("stage", "")).strip().lower()
+    if stage not in TASK_STAGES:
+        return None
+    current_step = str(data.get("current_step", "")).strip()
+    expected_action = str(data.get("expected_action", "")).strip()
+    prev = str(data.get("previous_stage", "")).strip().lower() or None
+    if prev and prev not in TASK_STAGES:
+        prev = None
+    pause_reason = str(data.get("pause_reason", "")).strip() or None
+    return TaskFSMState(
+        stage=stage,
+        current_step=current_step,
+        expected_action=expected_action,
+        previous_stage=prev,
+        pause_reason=pause_reason,
+    )
+
+
+def get_task_fsm_state(storage: SQLiteChatStorage, branch_id: int) -> TaskFSMState:
+    wm = storage.get_working_memory_dict(branch_id)
+    parsed = _parse_task_fsm(wm.get(TASK_FSM_KEY))
+    if parsed:
+        return parsed
+    return TaskFSMState(
+        stage=TASK_STAGE_PLANNING,
+        current_step="Сформировать план",
+        expected_action="Уточнить требования и подтвердить план",
+    )
+
+
+def set_task_fsm_state(storage: SQLiteChatStorage, branch_id: int, state: TaskFSMState) -> TaskFSMState:
+    if state.stage not in TASK_STAGES:
+        raise ValueError(f"Неизвестный этап: {state.stage}")
+    storage.upsert_working_memory(branch_id, TASK_FSM_KEY, _task_fsm_to_json(state))
+    return state
+
+
+def transition_task_fsm(
+    storage: SQLiteChatStorage,
+    branch_id: int,
+    target_stage: str,
+    *,
+    current_step: str | None = None,
+    expected_action: str | None = None,
+) -> TaskFSMState:
+    state = get_task_fsm_state(storage, branch_id)
+    dst = (target_stage or "").strip().lower()
+    if dst not in TASK_STAGES:
+        raise ValueError(f"Неизвестный этап: {target_stage}")
+    if dst == TASK_STAGE_PAUSED:
+        raise ValueError("Для паузы используйте pause_task_fsm().")
+    if state.stage == TASK_STAGE_PAUSED:
+        raise ValueError("Нельзя менять этап из paused напрямую, используйте resume_task_fsm().")
+    allowed = TASK_STAGE_TRANSITIONS.get(state.stage, tuple())
+    if dst != state.stage and dst not in allowed:
+        raise ValueError(f"Переход {state.stage} -> {dst} запрещен.")
+    next_state = TaskFSMState(
+        stage=dst,
+        current_step=(current_step if current_step is not None else state.current_step).strip(),
+        expected_action=(expected_action if expected_action is not None else state.expected_action).strip(),
+    )
+    return set_task_fsm_state(storage, branch_id, next_state)
+
+
+def pause_task_fsm(storage: SQLiteChatStorage, branch_id: int, reason: str | None = None) -> TaskFSMState:
+    state = get_task_fsm_state(storage, branch_id)
+    if state.stage == TASK_STAGE_PAUSED:
+        return state
+    paused = TaskFSMState(
+        stage=TASK_STAGE_PAUSED,
+        current_step=state.current_step,
+        expected_action=state.expected_action,
+        previous_stage=state.stage,
+        pause_reason=(reason or "").strip() or None,
+    )
+    return set_task_fsm_state(storage, branch_id, paused)
+
+
+def resume_task_fsm(storage: SQLiteChatStorage, branch_id: int) -> TaskFSMState:
+    state = get_task_fsm_state(storage, branch_id)
+    if state.stage != TASK_STAGE_PAUSED:
+        return state
+    prev = state.previous_stage or TASK_STAGE_EXECUTION
+    if prev not in TASK_STAGES or prev == TASK_STAGE_PAUSED:
+        prev = TASK_STAGE_EXECUTION
+    resumed = TaskFSMState(
+        stage=prev,
+        current_step=state.current_step,
+        expected_action=state.expected_action,
+        previous_stage=None,
+        pause_reason=None,
+    )
+    return set_task_fsm_state(storage, branch_id, resumed)
 
 
 def build_triple_context(
@@ -409,6 +559,232 @@ def send_message(
         total_tokens_chat=c_tokens,
         elapsed_sec=elapsed,
     )
+
+
+def send_message_stream(
+    storage: SQLiteChatStorage,
+    chat_id: int,
+    branch_id: int,
+    user_text: str,
+    *,
+    should_stop=None,
+):
+    """Стримит ответ токенами и в конце сохраняет результат в БД."""
+    user_text = (user_text or "").strip()
+    if not user_text:
+        raise ValueError("Пустое сообщение")
+
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise ValueError("Чат не найден")
+    branch = storage.get_branch(branch_id)
+    if not branch or branch.chat_id != chat_id:
+        raise ValueError("Ветка не найдена")
+
+    strategy = normalize_memory_strategy(branch.memory_strategy)
+    params = parse_strategy_params(branch)
+    agent = create_agent_for_branch(storage, branch_id)
+    tokens_merge: int | None = None
+    elapsed_merge = 0.0
+
+    if strategy == MEMORY_STRATEGY_TRIPLE:
+        yield {"type": "status", "phase": "wm_merge", "message": "Обновляю рабочую память..."}
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        tok_m, el_m = refresh_working_memory_auto(storage, agent, chat_id, branch_id, params)
+        tokens_merge = tok_m
+        elapsed_merge = el_m
+        ctx = build_triple_context(storage, chat_id, branch_id, params)
+        yield {"type": "status", "phase": "tools", "message": "Выполняю шаги и инструменты..."}
+        final: SendMessageResult | None = None
+        seen_delta = False
+        for ev in agent.complete_with_tools_stream_events(
+            ctx,
+            tools=_working_memory_tools(),
+            tool_executor=lambda n, a: _execute_working_memory_tool(storage, branch_id, n, a),
+            should_stop=should_stop,
+        ):
+            if ev.type == "delta" and ev.delta is not None:
+                if not seen_delta:
+                    seen_delta = True
+                    yield {"type": "status", "phase": "answer", "message": "Формирую ответ..."}
+                yield {"type": "delta", "delta": ev.delta}
+                continue
+            if ev.type != "done" or ev.result is None:
+                continue
+            result = ev.result
+            if result.text:
+                storage.append_message(chat_id, branch_id, "assistant", result.text)
+            total_llm_tokens = 0
+            if tokens_merge is not None:
+                total_llm_tokens += tokens_merge
+            if result.usage.total_tokens is not None:
+                total_llm_tokens += result.usage.total_tokens
+            if total_llm_tokens > 0:
+                storage.add_tokens(chat_id, branch_id, total_llm_tokens)
+            tok_display = total_llm_tokens if total_llm_tokens > 0 else result.usage.total_tokens
+            updated_branch = storage.get_branch(branch_id)
+            updated_chat = storage.get_chat(chat_id)
+            b_tokens = updated_branch.total_tokens if updated_branch else branch.total_tokens
+            c_tokens = updated_chat.total_tokens if updated_chat else chat.total_tokens
+            final = SendMessageResult(
+                assistant_text=result.text,
+                model=result.model,
+                tokens_this_turn=tok_display,
+                total_tokens_branch=b_tokens,
+                total_tokens_chat=c_tokens,
+                elapsed_sec=elapsed_merge + result.elapsed_sec,
+            )
+            yield {"type": "stopped", "stopped": bool(ev.stopped)}
+        if not final:
+            raise RuntimeError("Поток завершился без финального результата")
+        yield {"type": "done", "result": final}
+        return
+
+    if strategy == MEMORY_STRATEGY_STICKY:
+        yield {"type": "status", "phase": "facts", "message": "Обновляю sticky facts..."}
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        tok_m, el_m = refresh_sticky_facts(storage, agent, chat_id, branch_id, params)
+        tokens_merge = tok_m
+        elapsed_merge = el_m
+        ctx = build_sticky_context_after_user(storage, chat_id, branch_id, params)
+        stream_messages = ctx
+    elif strategy == MEMORY_STRATEGY_DEFAULT:
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        ctx = build_context_default(storage, branch_id)
+        stream_messages = [*ctx, {"role": "user", "content": user_text}]
+    elif strategy == MEMORY_STRATEGY_SLIDING:
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        ctx = build_context_sliding(storage, chat_id, branch_id, params)
+        stream_messages = [*ctx, {"role": "user", "content": user_text}]
+    else:
+        storage.append_message(chat_id, branch_id, "user", user_text)
+        ctx = storage.get_context_messages(branch_id)
+        stream_messages = [*ctx, {"role": "user", "content": user_text}]
+
+    final: SendMessageResult | None = None
+    emitted_answer_status = False
+    for ev in agent.complete_messages_stream_events(stream_messages, should_stop=should_stop):
+        if ev.type == "delta" and ev.delta is not None:
+            if not emitted_answer_status:
+                emitted_answer_status = True
+                yield {"type": "status", "phase": "answer", "message": "Формирую ответ..."}
+            yield {"type": "delta", "delta": ev.delta}
+            continue
+        if ev.type != "done" or ev.result is None:
+            continue
+
+        result = ev.result
+        storage.append_message(chat_id, branch_id, "assistant", result.text)
+        if strategy == MEMORY_STRATEGY_SUMMARY:
+            maybe_rollup_summaries(storage, agent, branch_id)
+        if strategy == MEMORY_STRATEGY_SLIDING:
+            wm = int(params.get("sliding_window_messages", MEMORY_DEFAULTS.sliding_window_messages))
+            storage.delete_old_user_assistant_keep_last(chat_id, branch_id, wm)
+
+        total_llm_tokens = 0
+        if tokens_merge is not None:
+            total_llm_tokens += tokens_merge
+        if result.usage.total_tokens is not None:
+            total_llm_tokens += result.usage.total_tokens
+        if total_llm_tokens > 0:
+            storage.add_tokens(chat_id, branch_id, total_llm_tokens)
+        tok_display = total_llm_tokens if total_llm_tokens > 0 else result.usage.total_tokens
+
+        updated_branch = storage.get_branch(branch_id)
+        updated_chat = storage.get_chat(chat_id)
+        b_tokens = updated_branch.total_tokens if updated_branch else branch.total_tokens
+        c_tokens = updated_chat.total_tokens if updated_chat else chat.total_tokens
+        final = SendMessageResult(
+            assistant_text=result.text,
+            model=result.model,
+            tokens_this_turn=tok_display,
+            total_tokens_branch=b_tokens,
+            total_tokens_chat=c_tokens,
+            elapsed_sec=elapsed_merge + result.elapsed_sec,
+        )
+        yield {"type": "stopped", "stopped": bool(ev.stopped)}
+
+    if not final:
+        raise RuntimeError("Поток завершился без финального результата")
+    yield {"type": "done", "result": final}
+
+
+def resume_last_answer_stream(
+    storage: SQLiteChatStorage,
+    chat_id: int,
+    branch_id: int,
+    *,
+    should_stop=None,
+):
+    """Продолжает последний ответ ассистента без добавления нового user-сообщения."""
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise ValueError("Чат не найден")
+    branch = storage.get_branch(branch_id)
+    if not branch or branch.chat_id != chat_id:
+        raise ValueError("Ветка не найдена")
+
+    strategy = normalize_memory_strategy(branch.memory_strategy)
+    params = parse_strategy_params(branch)
+    agent = create_agent_for_branch(storage, branch_id)
+
+    if strategy == MEMORY_STRATEGY_STICKY:
+        ctx = build_sticky_context_after_user(storage, chat_id, branch_id, params)
+    elif strategy == MEMORY_STRATEGY_DEFAULT:
+        ctx = build_context_default(storage, branch_id)
+    elif strategy == MEMORY_STRATEGY_SLIDING:
+        ctx = build_context_sliding(storage, chat_id, branch_id, params)
+    elif strategy == MEMORY_STRATEGY_TRIPLE:
+        ctx = build_triple_context(storage, chat_id, branch_id, params)
+    else:
+        ctx = storage.get_context_messages(branch_id)
+
+    last_assistant = storage.get_last_assistant_message(chat_id, branch_id)
+    if not last_assistant or not last_assistant.content.strip():
+        raise ValueError("Нет остановленного ответа для продолжения")
+
+    stream_messages = [
+        *ctx,
+        {
+            "role": "system",
+            "content": (
+                "Продолжи последний ответ ассистента с места остановки. "
+                "Не повторяй уже написанную часть, выдай только продолжение."
+            ),
+        },
+    ]
+
+    final: SendMessageResult | None = None
+    for ev in agent.complete_messages_stream_events(stream_messages, should_stop=should_stop):
+        if ev.type == "delta" and ev.delta is not None:
+            yield {"type": "status", "phase": "answer", "message": "Продолжаю ответ..."}
+            yield {"type": "delta", "delta": ev.delta}
+            continue
+        if ev.type != "done" or ev.result is None:
+            continue
+        result = ev.result
+        if result.text:
+            merged = last_assistant.content + result.text
+            storage.update_message_content(chat_id, last_assistant.message_id, merged)
+        if result.usage.total_tokens is not None:
+            storage.add_tokens(chat_id, branch_id, result.usage.total_tokens)
+        updated_branch = storage.get_branch(branch_id)
+        updated_chat = storage.get_chat(chat_id)
+        b_tokens = updated_branch.total_tokens if updated_branch else branch.total_tokens
+        c_tokens = updated_chat.total_tokens if updated_chat else chat.total_tokens
+        final = SendMessageResult(
+            assistant_text=result.text,
+            model=result.model,
+            tokens_this_turn=result.usage.total_tokens,
+            total_tokens_branch=b_tokens,
+            total_tokens_chat=c_tokens,
+            elapsed_sec=result.elapsed_sec,
+        )
+        yield {"type": "stopped", "stopped": bool(ev.stopped)}
+
+    if not final:
+        raise RuntimeError("Поток продолжения завершился без результата")
+    yield {"type": "done", "result": final}
 
 
 def create_agent(

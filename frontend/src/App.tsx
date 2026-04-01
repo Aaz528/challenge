@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   clearLongTermMemory,
   clearWorkingMemory,
@@ -10,17 +10,24 @@ import {
   fetchChats,
   fetchLongTermMemory,
   fetchMemoryProfiles,
+  fetchTaskFsm,
   fetchMessages,
   fetchWorkingMemory,
   forkBranch,
   patchBranch,
+  pauseTaskFsm,
   putLongTermMemoryItem,
   putWorkingMemoryItem,
-  sendMessage,
+  resumeTaskFsm,
+  resumeMessageStream,
+  sendMessageStream,
+  stopAndPauseMessageStream,
+  stopMessageStream,
   type Branch,
   type Chat,
   type MemoryItem,
   type MemoryProfile,
+  type TaskFSM,
   type Message,
 } from "./api";
 import "./App.css";
@@ -58,6 +65,16 @@ const MEMORY_STRATEGY_OPTIONS = [
   { value: "sticky_facts", label: "Sticky Facts / KV-память" },
   { value: "triple_memory", label: "Triple Memory (short/working/long)" },
 ] as const;
+
+type StreamPhase =
+  | "idle"
+  | "request"
+  | "facts"
+  | "wm_merge"
+  | "tools"
+  | "answer"
+  | "done"
+  | "stopped";
 
 export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
@@ -112,6 +129,12 @@ export default function App() {
   const [memoryProfiles, setMemoryProfiles] = useState<MemoryProfile[]>([]);
   const [tripleProfileChoice, setTripleProfileChoice] = useState("custom");
   const [ltProfileChoice, setLtProfileChoice] = useState("custom");
+  const [taskFsm, setTaskFsm] = useState<TaskFSM | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamStatus, setStreamStatus] = useState("");
+  const [streamPhase, setStreamPhase] = useState<StreamPhase>("idle");
+  const [canResumeAnswer, setCanResumeAnswer] = useState(false);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
     const list = await fetchChats();
@@ -251,6 +274,9 @@ export default function App() {
       return;
     }
     void loadWorkingMemoryList();
+    void fetchTaskFsm(activeChatId, activeBranchId)
+      .then((s) => setTaskFsm(s))
+      .catch(() => setTaskFsm(null));
   }, [
     showMemoryPanel,
     activeChatId,
@@ -302,6 +328,10 @@ export default function App() {
     if (!text || activeChatId == null || activeBranchId == null) return;
     setError(null);
     setLoading(true);
+    setIsStreaming(true);
+    setCanResumeAnswer(false);
+    setStreamStatus("Запрос отправлен...");
+    setStreamPhase("request");
     setInput("");
     const optimisticUser: Message = {
       id: -Date.now(),
@@ -309,9 +339,54 @@ export default function App() {
       content: text,
       summarized: false,
     };
-    setMessages((m) => [...m, optimisticUser]);
+    const optimisticAssistantId = -(Date.now() + 1);
+    const optimisticAssistant: Message = {
+      id: optimisticAssistantId,
+      role: "assistant",
+      content: "",
+      summarized: false,
+    };
+    setMessages((m) => [...m, optimisticUser, optimisticAssistant]);
     try {
-      await sendMessage(activeChatId, activeBranchId, text);
+      const ctrl = new AbortController();
+      streamAbortRef.current = ctrl;
+      await sendMessageStream(activeChatId, activeBranchId, text, (event) => {
+        if (event.type === "delta") {
+          setStreamPhase("answer");
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === optimisticAssistantId
+                ? { ...msg, content: msg.content + event.delta }
+                : msg,
+            ),
+          );
+          return;
+        }
+        if (event.type === "status") {
+          setStreamStatus(event.message || "Обработка...");
+          const p = event.phase as StreamPhase;
+          if (
+            p === "request" ||
+            p === "facts" ||
+            p === "wm_merge" ||
+            p === "tools" ||
+            p === "answer"
+          ) {
+            setStreamPhase(p);
+          }
+          return;
+        }
+        if (event.type === "stopped") {
+          setStreamStatus("Остановлено");
+          setStreamPhase("stopped");
+          return;
+        }
+        if (event.type === "error") {
+          throw new Error(event.message);
+        }
+      }, ctrl.signal);
+      setStreamPhase("done");
+      setStreamStatus("Готово");
       const msgs = await fetchMessages(activeChatId, activeBranchId);
       setMessages(msgs);
       await loadChats();
@@ -322,9 +397,104 @@ export default function App() {
         if (memoryTab === "long") void loadLongTermList();
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-      setMessages((m) => m.filter((x) => x.id !== optimisticUser.id));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("aborted") || msg.includes("AbortError")) {
+        const msgs = await fetchMessages(activeChatId, activeBranchId);
+        setMessages(msgs);
+      } else {
+        setError(msg);
+        setMessages((m) =>
+          m.filter((x) => x.id !== optimisticUser.id && x.id !== optimisticAssistantId),
+        );
+      }
     } finally {
+      streamAbortRef.current = null;
+      setStreamStatus("");
+      setStreamPhase("idle");
+      setIsStreaming(false);
+      setLoading(false);
+    }
+  };
+
+  const handleStopGenerate = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    try {
+      await stopMessageStream(activeChatId, activeBranchId);
+      setStreamStatus("Останавливаю...");
+      setStreamPhase("stopped");
+    } catch {
+      /* ignore stop errors */
+    }
+    streamAbortRef.current?.abort();
+  };
+
+  const handleStopAndPause = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    try {
+      const state = await stopAndPauseMessageStream(
+        activeChatId,
+        activeBranchId,
+        "Пауза пользователем во время генерации",
+      );
+      setTaskFsm(state);
+      setCanResumeAnswer(true);
+      setStreamStatus("Останавливаю и ставлю на паузу...");
+      setStreamPhase("stopped");
+    } catch {
+      setStreamStatus("Останавливаю...");
+      setStreamPhase("stopped");
+    }
+    streamAbortRef.current?.abort();
+  };
+
+  const handleResumeAnswer = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    setError(null);
+    setLoading(true);
+    setIsStreaming(true);
+    setStreamStatus("Продолжаю ответ...");
+    setStreamPhase("answer");
+    try {
+      const ctrl = new AbortController();
+      streamAbortRef.current = ctrl;
+      await resumeMessageStream(activeChatId, activeBranchId, (event) => {
+        if (event.type === "delta") {
+          setMessages((prev) => {
+            for (let i = prev.length - 1; i >= 0; i -= 1) {
+              if (prev[i].role === "assistant") {
+                const next = [...prev];
+                next[i] = { ...next[i], content: next[i].content + event.delta };
+                return next;
+              }
+            }
+            return prev;
+          });
+          return;
+        }
+        if (event.type === "status") {
+          setStreamStatus(event.message || "Продолжаю...");
+          return;
+        }
+        if (event.type === "error") {
+          throw new Error(event.message);
+        }
+      }, ctrl.signal);
+      const msgs = await fetchMessages(activeChatId, activeBranchId);
+      setMessages(msgs);
+      await loadChats();
+      const br = await fetchBranches(activeChatId);
+      setBranches(br);
+      setCanResumeAnswer(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!msg.includes("aborted") && !msg.includes("AbortError")) {
+        setError(msg);
+      }
+    } finally {
+      streamAbortRef.current = null;
+      setStreamStatus("");
+      setStreamPhase("idle");
+      setIsStreaming(false);
       setLoading(false);
     }
   };
@@ -454,8 +624,43 @@ export default function App() {
     try {
       if (memoryTab === "working") await loadWorkingMemoryList();
       else await loadLongTermList();
+      if (activeChatId != null && activeBranchId != null) {
+        const s = await fetchTaskFsm(activeChatId, activeBranchId);
+        setTaskFsm(s);
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handlePauseTask = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const s = await pauseTaskFsm(activeChatId, activeBranchId);
+      setTaskFsm(s);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResumeTask = async () => {
+    if (activeChatId == null || activeBranchId == null) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const s = await resumeTaskFsm(activeChatId, activeBranchId);
+      setTaskFsm(s);
+      if (canResumeAnswer) {
+        await handleResumeAnswer();
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -597,6 +802,20 @@ export default function App() {
     memoryTab === "working" ? workingMemoryItems : longTermItems;
   const filteredMemoryItems = filterMemoryItems(currentMemoryItems);
   const memoryTypeStats = getTypeStats(currentMemoryItems);
+  const phaseStep = (() => {
+    if (streamPhase === "request") return 0;
+    if (streamPhase === "facts" || streamPhase === "wm_merge" || streamPhase === "tools") return 1;
+    if (streamPhase === "answer") return 2;
+    if (streamPhase === "done") return 3;
+    if (streamPhase === "stopped") return 2;
+    return -1;
+  })();
+  const phaseTwoLabel = (() => {
+    const strategy = activeBranch?.memory_strategy ?? "summary";
+    if (strategy === "sticky_facts") return "2. Sticky Facts";
+    if (strategy === "triple_memory") return "2. Working/Tools";
+    return "2. Контекст";
+  })();
 
   return (
     <div className="layout">
@@ -849,6 +1068,25 @@ export default function App() {
             </div>
             {error && <div className="err">{error}</div>}
             <div className="composer">
+              {isStreaming && streamStatus && (
+                <div className="stream-progress" aria-live="polite">
+                  <div className="stream-stepper">
+                    <span className={phaseStep >= 0 ? "stream-step active" : "stream-step"}>
+                      1. Отправка
+                    </span>
+                    <span className={phaseStep >= 1 ? "stream-step active" : "stream-step"}>
+                      {phaseTwoLabel}
+                    </span>
+                    <span className={phaseStep >= 2 ? "stream-step active" : "stream-step"}>
+                      3. Ответ
+                    </span>
+                    <span className={phaseStep >= 3 ? "stream-step active" : "stream-step"}>
+                      4. Готово
+                    </span>
+                  </div>
+                  <div className="hint">{streamStatus}</div>
+                </div>
+              )}
               <textarea
                 rows={3}
                 placeholder="Сообщение…"
@@ -870,21 +1108,73 @@ export default function App() {
               >
                 Отправить
               </button>
+              {isStreaming && (
+                <>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void handleStopGenerate()}
+                  >
+                    Стоп
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void handleStopAndPause()}
+                  >
+                    Стоп + Пауза
+                  </button>
+                </>
+              )}
+              {!isStreaming && canResumeAnswer && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void handleResumeAnswer()}
+                >
+                  Продолжить ответ
+                </button>
+              )}
             </div>
             </div>
             {showMemoryPanel && activeBranchId != null && activeChatId != null && (
               <aside className="memory-panel" aria-label="Память ветки">
                 <div className="memory-panel-head">
                   <h2>Память</h2>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={loading}
-                    onClick={() => void refreshMemoryPanel()}
-                  >
-                    Обновить
-                  </button>
+                  <div className="memory-actions">
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={loading}
+                      onClick={() => void refreshMemoryPanel()}
+                    >
+                      Обновить
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={loading || taskFsm?.stage === "paused"}
+                      onClick={() => void handlePauseTask()}
+                    >
+                      Пауза
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={loading || taskFsm?.stage !== "paused"}
+                      onClick={() => void handleResumeTask()}
+                    >
+                      Продолжить
+                    </button>
+                  </div>
                 </div>
+                {taskFsm && (
+                  <div className="memory-fsm">
+                    <div><strong>Этап:</strong> {taskFsm.stage}</div>
+                    <div><strong>Шаг:</strong> {taskFsm.current_step || "—"}</div>
+                    <div><strong>Ожидаемое действие:</strong> {taskFsm.expected_action || "—"}</div>
+                  </div>
+                )}
                 <div className="memory-tabs" role="tablist">
                   <button
                     type="button"

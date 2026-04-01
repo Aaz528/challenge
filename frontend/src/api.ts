@@ -83,6 +83,172 @@ export async function sendMessage(
   );
 }
 
+export type StreamEvent =
+  | { type: "delta"; delta: string }
+  | { type: "done"; payload: SendMessageResponse }
+  | { type: "status"; phase: string; message: string }
+  | { type: "stopped"; stopped: boolean }
+  | { type: "error"; message: string };
+
+export async function sendMessageStream(
+  chatId: number,
+  branchId: number,
+  content: string,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/chats/${chatId}/branches/${branchId}/messages/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    throw new Error(text || res.statusText);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() ?? "";
+
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      let eventName = "";
+      let dataRaw = "";
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        if (line.startsWith("data:")) dataRaw += line.slice(5).trim();
+      }
+      if (!eventName || !dataRaw) continue;
+      let data: unknown = null;
+      try {
+        data = JSON.parse(dataRaw);
+      } catch {
+        continue;
+      }
+      if (eventName === "delta" && typeof (data as { delta?: unknown }).delta === "string") {
+        onEvent({ type: "delta", delta: (data as { delta: string }).delta });
+      } else if (eventName === "status") {
+        const d = data as { phase?: unknown; message?: unknown };
+        onEvent({
+          type: "status",
+          phase: typeof d.phase === "string" ? d.phase : "",
+          message: typeof d.message === "string" ? d.message : "",
+        });
+      } else if (eventName === "done") {
+        onEvent({ type: "done", payload: data as SendMessageResponse });
+      } else if (eventName === "stopped") {
+        onEvent({ type: "stopped", stopped: Boolean((data as { stopped?: unknown }).stopped) });
+      } else if (eventName === "error") {
+        onEvent({
+          type: "error",
+          message:
+            typeof (data as { message?: unknown }).message === "string"
+              ? (data as { message: string }).message
+              : "stream error",
+        });
+      }
+    }
+  }
+}
+
+export async function resumeMessageStream(
+  chatId: number,
+  branchId: number,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/chats/${chatId}/branches/${branchId}/messages/resume-stream`, {
+    method: "POST",
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    throw new Error(text || res.statusText);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      let eventName = "";
+      let dataRaw = "";
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        if (line.startsWith("data:")) dataRaw += line.slice(5).trim();
+      }
+      if (!eventName || !dataRaw) continue;
+      let data: unknown = null;
+      try {
+        data = JSON.parse(dataRaw);
+      } catch {
+        continue;
+      }
+      if (eventName === "delta" && typeof (data as { delta?: unknown }).delta === "string") {
+        onEvent({ type: "delta", delta: (data as { delta: string }).delta });
+      } else if (eventName === "status") {
+        const d = data as { phase?: unknown; message?: unknown };
+        onEvent({
+          type: "status",
+          phase: typeof d.phase === "string" ? d.phase : "",
+          message: typeof d.message === "string" ? d.message : "",
+        });
+      } else if (eventName === "done") {
+        onEvent({ type: "done", payload: data as SendMessageResponse });
+      } else if (eventName === "stopped") {
+        onEvent({ type: "stopped", stopped: Boolean((data as { stopped?: unknown }).stopped) });
+      } else if (eventName === "error") {
+        onEvent({
+          type: "error",
+          message:
+            typeof (data as { message?: unknown }).message === "string"
+              ? (data as { message: string }).message
+              : "stream error",
+        });
+      }
+    }
+  }
+}
+
+export async function stopMessageStream(
+  chatId: number,
+  branchId: number,
+): Promise<{ ok: boolean; found: boolean }> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/messages/stop`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function stopAndPauseMessageStream(
+  chatId: number,
+  branchId: number,
+  reason?: string,
+): Promise<TaskFSM> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/messages/stop-and-pause`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: reason ?? "Остановлено пользователем во время генерации" }),
+    }),
+  );
+}
+
 export async function forkBranch(
   chatId: number,
   parentBranchId: number,
@@ -129,8 +295,50 @@ export type MemoryProfile = {
   user_id: string;
 };
 
+export type TaskFSM = {
+  stage: string;
+  current_step: string;
+  expected_action: string;
+  previous_stage?: string | null;
+  pause_reason?: string | null;
+};
+
 export async function fetchMemoryProfiles(): Promise<MemoryProfile[]> {
   return json(await fetch("/api/memory-profiles"));
+}
+
+export async function fetchTaskFsm(
+  chatId: number,
+  branchId: number,
+): Promise<TaskFSM> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/task-fsm`),
+  );
+}
+
+export async function pauseTaskFsm(
+  chatId: number,
+  branchId: number,
+  reason?: string,
+): Promise<TaskFSM> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/task-fsm/pause`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: reason ?? null }),
+    }),
+  );
+}
+
+export async function resumeTaskFsm(
+  chatId: number,
+  branchId: number,
+): Promise<TaskFSM> {
+  return json(
+    await fetch(`/api/chats/${chatId}/branches/${branchId}/task-fsm/resume`, {
+      method: "POST",
+    }),
+  );
 }
 
 export async function fetchWorkingMemory(

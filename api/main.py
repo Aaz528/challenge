@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app_settings import MEMORY_PROFILE_PRESETS, MEMORY_STRATEGIES, SETTINGS, WEB_SETTINGS
-from chat_service import send_message
+from chat_service import (
+    TaskFSMState,
+    pause_task_fsm,
+    resume_task_fsm,
+    resume_last_answer_stream,
+    send_message,
+    send_message_stream,
+    set_task_fsm_state,
+    transition_task_fsm,
+    get_task_fsm_state,
+)
 from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
 
 from api.deps import get_storage
@@ -22,6 +34,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_stream_stop_lock = threading.Lock()
+_stream_stops: dict[tuple[int, int], threading.Event] = {}
 
 
 class ChatOut(BaseModel):
@@ -85,6 +100,24 @@ class MemoryProfileOut(BaseModel):
     user_id: str
 
 
+class TaskFSMOut(BaseModel):
+    stage: str
+    current_step: str
+    expected_action: str
+    previous_stage: str | None = None
+    pause_reason: str | None = None
+
+
+class PatchTaskFSMBody(BaseModel):
+    stage: str | None = None
+    current_step: str | None = None
+    expected_action: str | None = None
+
+
+class PauseTaskBody(BaseModel):
+    reason: str | None = None
+
+
 class ForkBody(BaseModel):
     fork_after_message_id: int = Field(..., description="ID сообщения в текущей ветке — история до него включительно копируется")
     title: str = "Новая ветка"
@@ -142,6 +175,20 @@ def _branch_out(b: BranchInfo) -> BranchOut:
         memory_strategy=b.memory_strategy,
         strategy_params_json=b.strategy_params_json,
     )
+
+
+def _task_out(state: TaskFSMState) -> TaskFSMOut:
+    return TaskFSMOut(
+        stage=state.stage,
+        current_step=state.current_step,
+        expected_action=state.expected_action,
+        previous_stage=state.previous_stage,
+        pause_reason=state.pause_reason,
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @app.get("/api/health")
@@ -234,6 +281,92 @@ def get_branch_facts(
     if not b or b.chat_id != chat_id:
         raise HTTPException(status_code=404, detail="Ветка не найдена")
     return storage.get_branch_facts_dict(branch_id)
+
+
+@app.get("/api/chats/{chat_id}/branches/{branch_id}/task-fsm", response_model=TaskFSMOut)
+def get_task_fsm(
+    chat_id: int,
+    branch_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> TaskFSMOut:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    return _task_out(get_task_fsm_state(storage, branch_id))
+
+
+@app.patch("/api/chats/{chat_id}/branches/{branch_id}/task-fsm", response_model=TaskFSMOut)
+def patch_task_fsm(
+    chat_id: int,
+    branch_id: int,
+    body: PatchTaskFSMBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> TaskFSMOut:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    try:
+        if body.stage is not None:
+            state = transition_task_fsm(
+                storage,
+                branch_id,
+                body.stage,
+                current_step=body.current_step,
+                expected_action=body.expected_action,
+            )
+        else:
+            current = get_task_fsm_state(storage, branch_id)
+            state = set_task_fsm_state(
+                storage,
+                branch_id,
+                TaskFSMState(
+                    stage=current.stage,
+                    current_step=(body.current_step if body.current_step is not None else current.current_step),
+                    expected_action=(
+                        body.expected_action if body.expected_action is not None else current.expected_action
+                    ),
+                    previous_stage=current.previous_stage,
+                    pause_reason=current.pause_reason,
+                ),
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _task_out(state)
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/task-fsm/pause", response_model=TaskFSMOut)
+def post_task_pause(
+    chat_id: int,
+    branch_id: int,
+    body: PauseTaskBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> TaskFSMOut:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    state = pause_task_fsm(storage, branch_id, body.reason)
+    return _task_out(state)
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/task-fsm/resume", response_model=TaskFSMOut)
+def post_task_resume(
+    chat_id: int,
+    branch_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> TaskFSMOut:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    state = resume_task_fsm(storage, branch_id)
+    return _task_out(state)
 
 
 @app.get(
@@ -459,6 +592,166 @@ def post_branch_message(
         total_tokens_chat=result.total_tokens_chat,
         elapsed_sec=result.elapsed_sec,
     )
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/messages/stream")
+def post_branch_message_stream(
+    chat_id: int,
+    branch_id: int,
+    body: SendMessageBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> StreamingResponse:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    key = (chat_id, branch_id)
+    stop_event = threading.Event()
+    with _stream_stop_lock:
+        _stream_stops[key] = stop_event
+
+    def event_iter():
+        try:
+            for ev in send_message_stream(
+                storage,
+                chat_id,
+                branch_id,
+                body.content,
+                should_stop=lambda: stop_event.is_set(),
+            ):
+                if ev.get("type") == "delta":
+                    yield _sse("delta", {"delta": str(ev.get("delta", ""))})
+                elif ev.get("type") == "status":
+                    yield _sse(
+                        "status",
+                        {
+                            "phase": str(ev.get("phase", "")),
+                            "message": str(ev.get("message", "")),
+                        },
+                    )
+                elif ev.get("type") == "stopped":
+                    yield _sse("stopped", {"stopped": bool(ev.get("stopped"))})
+                elif ev.get("type") == "done":
+                    r = ev.get("result")
+                    if r is None:
+                        continue
+                    yield _sse(
+                        "done",
+                        {
+                            "assistant_text": r.assistant_text,
+                            "model": r.model,
+                            "tokens_this_turn": r.tokens_this_turn,
+                            "total_tokens_branch": r.total_tokens_branch,
+                            "total_tokens_chat": r.total_tokens_chat,
+                            "elapsed_sec": r.elapsed_sec,
+                        },
+                    )
+        except ValueError as e:
+            yield _sse("error", {"message": str(e)})
+        except Exception as e:
+            yield _sse("error", {"message": f"stream_failed: {e}"})
+        finally:
+            with _stream_stop_lock:
+                if _stream_stops.get(key) is stop_event:
+                    _stream_stops.pop(key, None)
+
+    return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/messages/resume-stream")
+def post_branch_message_resume_stream(
+    chat_id: int,
+    branch_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> StreamingResponse:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    key = (chat_id, branch_id)
+    stop_event = threading.Event()
+    with _stream_stop_lock:
+        _stream_stops[key] = stop_event
+
+    def event_iter():
+        try:
+            for ev in resume_last_answer_stream(
+                storage,
+                chat_id,
+                branch_id,
+                should_stop=lambda: stop_event.is_set(),
+            ):
+                if ev.get("type") == "delta":
+                    yield _sse("delta", {"delta": str(ev.get("delta", ""))})
+                elif ev.get("type") == "status":
+                    yield _sse(
+                        "status",
+                        {
+                            "phase": str(ev.get("phase", "")),
+                            "message": str(ev.get("message", "")),
+                        },
+                    )
+                elif ev.get("type") == "stopped":
+                    yield _sse("stopped", {"stopped": bool(ev.get("stopped"))})
+                elif ev.get("type") == "done":
+                    r = ev.get("result")
+                    if r is None:
+                        continue
+                    yield _sse(
+                        "done",
+                        {
+                            "assistant_text": r.assistant_text,
+                            "model": r.model,
+                            "tokens_this_turn": r.tokens_this_turn,
+                            "total_tokens_branch": r.total_tokens_branch,
+                            "total_tokens_chat": r.total_tokens_chat,
+                            "elapsed_sec": r.elapsed_sec,
+                        },
+                    )
+        except ValueError as e:
+            yield _sse("error", {"message": str(e)})
+        except Exception as e:
+            yield _sse("error", {"message": f"resume_stream_failed: {e}"})
+        finally:
+            with _stream_stop_lock:
+                if _stream_stops.get(key) is stop_event:
+                    _stream_stops.pop(key, None)
+
+    return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/messages/stop")
+def post_branch_message_stop(chat_id: int, branch_id: int) -> dict[str, bool]:
+    key = (chat_id, branch_id)
+    with _stream_stop_lock:
+        ev = _stream_stops.get(key)
+    if ev is None:
+        return {"ok": False, "found": False}
+    ev.set()
+    return {"ok": True, "found": True}
+
+
+@app.post("/api/chats/{chat_id}/branches/{branch_id}/messages/stop-and-pause", response_model=TaskFSMOut)
+def post_branch_message_stop_and_pause(
+    chat_id: int,
+    branch_id: int,
+    body: PauseTaskBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> TaskFSMOut:
+    if not storage.get_chat(chat_id):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    b = storage.get_branch(branch_id)
+    if not b or b.chat_id != chat_id:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    key = (chat_id, branch_id)
+    with _stream_stop_lock:
+        ev = _stream_stops.get(key)
+    if ev is not None:
+        ev.set()
+    state = pause_task_fsm(storage, branch_id, body.reason)
+    return _task_out(state)
 
 
 @app.get("/api/chats/{chat_id}/messages", response_model=list[MessageOut])

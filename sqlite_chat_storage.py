@@ -820,6 +820,34 @@ class SQLiteChatStorage:
         cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (chat_id,))
         self._conn.commit()
 
+    def get_last_assistant_message(self, chat_id: int, branch_id: int) -> MessageRow | None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT id, role, content, is_summarized
+            FROM messages
+            WHERE chat_id=? AND branch_id=? AND role='assistant'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, branch_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return MessageRow(
+            message_id=int(row["id"]),
+            role=str(row["role"]),
+            content=str(row["content"]),
+            is_summarized=int(row["is_summarized"]),
+        )
+
+    def update_message_content(self, chat_id: int, message_id: int, content: str) -> None:
+        cur = self._conn.cursor()
+        cur.execute("UPDATE messages SET content=? WHERE id=?", (content, message_id))
+        cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (chat_id,))
+        self._conn.commit()
+
     def add_tokens(self, chat_id: int, branch_id: int, delta_tokens: int) -> None:
         if delta_tokens <= 0:
             return
