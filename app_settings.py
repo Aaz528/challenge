@@ -73,6 +73,17 @@ class MemoryStrategyDefaults:
 MEMORY_DEFAULTS = MemoryStrategyDefaults()
 
 
+# Инварианты (хранятся отдельно от диалога, scope: user_id)
+INVARIANT_CATEGORIES = (
+    "architecture",
+    "decision",
+    "stack",
+    "business",
+    "other",
+)
+INVARIANT_SEVERITIES = ("hard", "soft")
+
+
 MEMORY_PROFILE_PRESETS = (
     {
         "id": "profile_basic",

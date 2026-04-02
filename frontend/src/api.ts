@@ -288,6 +288,76 @@ export type MemoryItem = {
   updated_at: string;
 };
 
+export type Invariant = {
+  id: number;
+  user_id: string;
+  category: string;
+  severity: string;
+  title: string;
+  statement: string;
+  active: boolean;
+  updated_at: string;
+};
+
+export async function fetchInvariants(userId: string): Promise<Invariant[]> {
+  return json(
+    await fetch(`/api/users/${encodeURIComponent(userId)}/invariants`),
+  );
+}
+
+export async function createInvariant(
+  userId: string,
+  body: {
+    category: string;
+    severity: string;
+    title: string;
+    statement: string;
+  },
+): Promise<Invariant> {
+  return json(
+    await fetch(`/api/users/${encodeURIComponent(userId)}/invariants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function patchInvariant(
+  userId: string,
+  invariantId: number,
+  body: {
+    category?: string | null;
+    severity?: string | null;
+    title?: string | null;
+    statement?: string | null;
+    active?: boolean | null;
+  },
+): Promise<Invariant> {
+  return json(
+    await fetch(
+      `/api/users/${encodeURIComponent(userId)}/invariants/${invariantId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  );
+}
+
+export async function deleteInvariant(
+  userId: string,
+  invariantId: number,
+): Promise<{ deleted: boolean }> {
+  return json(
+    await fetch(
+      `/api/users/${encodeURIComponent(userId)}/invariants/${invariantId}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
 export type MemoryProfile = {
   id: string;
   title: string;

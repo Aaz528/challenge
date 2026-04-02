@@ -74,6 +74,43 @@ def parse_strategy_params(branch: BranchInfo) -> dict:
         return {}
 
 
+def user_id_for_invariants(branch: BranchInfo, params: dict | None = None) -> str:
+    p = params if params is not None else parse_strategy_params(branch)
+    uid = str(p.get("user_id", MEMORY_DEFAULTS.triple_default_user_id)).strip()
+    return uid if uid else MEMORY_DEFAULTS.triple_default_user_id
+
+
+def apply_invariants_to_context(
+    storage: SQLiteChatStorage,
+    branch_id: int,
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Вставляет system-блок с инвариантами сразу после первого system-сообщения (обычно prompt ветки)."""
+    b = storage.get_branch(branch_id)
+    if not b:
+        return messages
+    uid = user_id_for_invariants(b)
+    rows = storage.list_invariants(uid, active_only=True)
+    if not rows:
+        return messages
+    lines = [
+        f"Инварианты пользователя (user_id={uid}), хранятся отдельно от диалога. "
+        "Учитывай их в рассуждениях и в финальном ответе.",
+        'Инварианты с severity "hard" нельзя нарушать: если запрос пользователя требует их нарушения — '
+        "не выполняй его в таком виде; кратко объясни конфликт и предложи допустимую альтернативу или уточняющие вопросы.",
+        'Инварианты с severity "soft" желательно соблюдать; если нельзя — явно укажи конфликт.',
+        "",
+    ]
+    for r in rows:
+        lines.append(f"- [{r.category}] ({r.severity}) {r.title}: {r.statement}")
+    inv_msg: dict[str, str] = {"role": "system", "content": "\n".join(lines)}
+    if not messages:
+        return [inv_msg]
+    if messages[0].get("role") == "system":
+        return [messages[0], inv_msg, *messages[1:]]
+    return [inv_msg, *messages]
+
+
 def _ua_rows(storage: SQLiteChatStorage, chat_id: int, branch_id: int):
     return [
         r
@@ -90,7 +127,7 @@ def build_context_default(storage: SQLiteChatStorage, branch_id: int) -> list[di
     out: list[dict[str, str]] = [{"role": "system", "content": b.system_prompt}]
     for r in rows:
         out.append({"role": r.role, "content": r.content})
-    return out
+    return apply_invariants_to_context(storage, branch_id, out)
 
 
 def build_context_sliding(
@@ -109,7 +146,7 @@ def build_context_sliding(
     out: list[dict[str, str]] = [{"role": "system", "content": b.system_prompt}]
     for r in tail:
         out.append({"role": r.role, "content": r.content})
-    return out
+    return apply_invariants_to_context(storage, branch_id, out)
 
 
 def refresh_sticky_facts(
@@ -146,7 +183,7 @@ def build_sticky_context_after_user(
     ]
     for r in tail:
         out.append({"role": r.role, "content": r.content})
-    return out
+    return apply_invariants_to_context(storage, branch_id, out)
 
 
 def _stringify_kv(rows) -> str:
@@ -309,7 +346,7 @@ def build_triple_context(
     ]
     for r in tail:
         out.append({"role": r.role, "content": r.content})
-    return out
+    return apply_invariants_to_context(storage, branch_id, out)
 
 
 def refresh_working_memory_auto(
@@ -536,7 +573,7 @@ def send_message(
         tok_display = total_llm_tokens if total_llm_tokens > 0 else result.usage.total_tokens
         elapsed = elapsed_merge + result.elapsed_sec
     else:
-        ctx = storage.get_context_messages(branch_id)
+        ctx = apply_invariants_to_context(storage, branch_id, storage.get_context_messages(branch_id))
         result = agent.chat_turn_with_messages(ctx, user_text)
         storage.append_message(chat_id, branch_id, "user", user_text)
         storage.append_message(chat_id, branch_id, "assistant", result.text)
@@ -658,7 +695,7 @@ def send_message_stream(
         stream_messages = [*ctx, {"role": "user", "content": user_text}]
     else:
         storage.append_message(chat_id, branch_id, "user", user_text)
-        ctx = storage.get_context_messages(branch_id)
+        ctx = apply_invariants_to_context(storage, branch_id, storage.get_context_messages(branch_id))
         stream_messages = [*ctx, {"role": "user", "content": user_text}]
 
     final: SendMessageResult | None = None
@@ -737,7 +774,7 @@ def resume_last_answer_stream(
     elif strategy == MEMORY_STRATEGY_TRIPLE:
         ctx = build_triple_context(storage, chat_id, branch_id, params)
     else:
-        ctx = storage.get_context_messages(branch_id)
+        ctx = apply_invariants_to_context(storage, branch_id, storage.get_context_messages(branch_id))
 
     last_assistant = storage.get_last_assistant_message(chat_id, branch_id)
     if not last_assistant or not last_assistant.content.strip():

@@ -3,11 +3,14 @@ import {
   clearLongTermMemory,
   clearWorkingMemory,
   createChat,
+  createInvariant,
+  deleteInvariant,
   deleteLongTermMemoryItem,
   deleteWorkingMemoryItem,
   fetchBranchFacts,
   fetchBranches,
   fetchChats,
+  fetchInvariants,
   fetchLongTermMemory,
   fetchMemoryProfiles,
   fetchTaskFsm,
@@ -25,6 +28,7 @@ import {
   stopMessageStream,
   type Branch,
   type Chat,
+  type Invariant,
   type MemoryItem,
   type MemoryProfile,
   type TaskFSM,
@@ -57,6 +61,19 @@ function profileChoiceFromUserId(
   const found = profiles.find((p) => p.user_id === uid);
   return found ? found.id : "custom";
 }
+
+const INVARIANT_CATEGORY_OPTIONS = [
+  { value: "architecture", label: "Архитектура" },
+  { value: "decision", label: "Решение" },
+  { value: "stack", label: "Стек" },
+  { value: "business", label: "Бизнес" },
+  { value: "other", label: "Другое" },
+] as const;
+
+const INVARIANT_SEVERITY_OPTIONS = [
+  { value: "hard", label: "hard (нельзя нарушать)" },
+  { value: "soft", label: "soft (предпочтительно)" },
+] as const;
 
 const MEMORY_STRATEGY_OPTIONS = [
   { value: "default", label: "Полная история (без summary)" },
@@ -105,7 +122,9 @@ export default function App() {
   );
   const [factsPreview, setFactsPreview] = useState("");
   const [showMemoryPanel, setShowMemoryPanel] = useState(false);
-  const [memoryTab, setMemoryTab] = useState<"working" | "long">("working");
+  const [memoryTab, setMemoryTab] = useState<"working" | "long" | "invariants">(
+    "working",
+  );
   const [memorySearch, setMemorySearch] = useState("");
   const [workingMemoryItems, setWorkingMemoryItems] = useState<MemoryItem[]>(
     [],
@@ -126,6 +145,13 @@ export default function App() {
   const [ltLoading, setLtLoading] = useState(false);
   const [wmError, setWmError] = useState<string | null>(null);
   const [ltError, setLtError] = useState<string | null>(null);
+  const [invariantItems, setInvariantItems] = useState<Invariant[]>([]);
+  const [invLoading, setInvLoading] = useState(false);
+  const [invError, setInvError] = useState<string | null>(null);
+  const [newInvCategory, setNewInvCategory] = useState("architecture");
+  const [newInvSeverity, setNewInvSeverity] = useState("hard");
+  const [newInvTitle, setNewInvTitle] = useState("");
+  const [newInvStatement, setNewInvStatement] = useState("");
   const [memoryProfiles, setMemoryProfiles] = useState<MemoryProfile[]>([]);
   const [tripleProfileChoice, setTripleProfileChoice] = useState("custom");
   const [ltProfileChoice, setLtProfileChoice] = useState("custom");
@@ -269,6 +295,32 @@ export default function App() {
     }
   }, [memoryLtUserId]);
 
+  const loadInvariantList = useCallback(async () => {
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
+    setInvLoading(true);
+    setInvError(null);
+    try {
+      const list = await fetchInvariants(uid);
+      setInvariantItems(list);
+    } catch (e: unknown) {
+      setInvariantItems([]);
+      setInvError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInvLoading(false);
+    }
+  }, [memoryLtUserId]);
+
+  useEffect(() => {
+    if (
+      !showMemoryPanel ||
+      memoryTab !== "invariants" ||
+      !memoryLtUserId.trim()
+    ) {
+      return;
+    }
+    void loadInvariantList();
+  }, [showMemoryPanel, memoryTab, memoryLtUserId, loadInvariantList]);
+
   useEffect(() => {
     if (!showMemoryPanel || activeChatId == null || activeBranchId == null) {
       return;
@@ -395,6 +447,7 @@ export default function App() {
       if (showMemoryPanel) {
         void loadWorkingMemoryList();
         if (memoryTab === "long") void loadLongTermList();
+        if (memoryTab === "invariants") void loadInvariantList();
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -551,6 +604,17 @@ export default function App() {
     );
   };
 
+  const filterInvariantItems = (items: Invariant[]) => {
+    const q = memorySearch.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(
+      (it) =>
+        it.title.toLowerCase().includes(q) ||
+        it.statement.toLowerCase().includes(q) ||
+        it.category.toLowerCase().includes(q),
+    );
+  };
+
   const detectValueType = (raw: string) => {
     const t = raw.trim();
     if (!t) return "empty";
@@ -600,8 +664,8 @@ export default function App() {
         const n = parseInt(editTripleTail, 10);
         params.triple_short_tail_messages =
           Number.isFinite(n) && n > 0 ? n : 12;
-        params.user_id = editTripleUserId.trim() || DEFAULT_PROFILE_USER_ID;
       }
+      params.user_id = editTripleUserId.trim() || DEFAULT_PROFILE_USER_ID;
       await patchBranch(activeChatId, activeBranchId, {
         system_prompt: editSp,
         temperature: parseFloat(editTemp),
@@ -623,7 +687,8 @@ export default function App() {
   const refreshMemoryPanel = async () => {
     try {
       if (memoryTab === "working") await loadWorkingMemoryList();
-      else await loadLongTermList();
+      else if (memoryTab === "long") await loadLongTermList();
+      else await loadInvariantList();
       if (activeChatId != null && activeBranchId != null) {
         const s = await fetchTaskFsm(activeChatId, activeBranchId);
         setTaskFsm(s);
@@ -771,6 +836,45 @@ export default function App() {
     }
   };
 
+  const handleAddInvariant = async () => {
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
+    const title = newInvTitle.trim();
+    const statement = newInvStatement.trim();
+    if (!title || !statement) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await createInvariant(uid, {
+        category: newInvCategory,
+        severity: newInvSeverity,
+        title,
+        statement,
+      });
+      setNewInvTitle("");
+      setNewInvStatement("");
+      await loadInvariantList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteInvariant = async (id: number) => {
+    const uid = memoryLtUserId.trim() || DEFAULT_PROFILE_USER_ID;
+    if (!window.confirm("Удалить этот инвариант?")) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await deleteInvariant(uid, id);
+      await loadInvariantList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleSaveEdit = async () => {
     if (editTarget == null || activeChatId == null || activeBranchId == null)
       return;
@@ -799,9 +903,14 @@ export default function App() {
   };
 
   const currentMemoryItems =
-    memoryTab === "working" ? workingMemoryItems : longTermItems;
+    memoryTab === "working"
+      ? workingMemoryItems
+      : memoryTab === "long"
+        ? longTermItems
+        : [];
   const filteredMemoryItems = filterMemoryItems(currentMemoryItems);
   const memoryTypeStats = getTypeStats(currentMemoryItems);
+  const filteredInvariantItems = filterInvariantItems(invariantItems);
   const phaseStep = (() => {
     if (streamPhase === "request") return 0;
     if (streamPhase === "facts" || streamPhase === "wm_merge" || streamPhase === "tools") return 1;
@@ -952,45 +1061,43 @@ export default function App() {
                   </>
                 )}
                 {editStrategy === "triple_memory" && (
-                  <>
-                    <label>
-                      Short-term хвост (сообщений user+assistant)
-                      <input
-                        type="number"
-                        min={1}
-                        value={editTripleTail}
-                        onChange={(e) => setEditTripleTail(e.target.value)}
-                      />
-                    </label>
-                    <label>
-                      Профиль long-term памяти
-                      <select
-                        value={tripleProfileChoice}
-                        onChange={(e) => {
-                          const choice = e.target.value;
-                          setTripleProfileChoice(choice);
-                          const picked = memoryProfiles.find((p) => p.id === choice);
-                          if (picked) setEditTripleUserId(picked.user_id);
-                        }}
-                      >
-                        {memoryProfiles.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.title}
-                          </option>
-                        ))}
-                        <option value="custom">Пользовательский (manual)</option>
-                      </select>
-                    </label>
-                    {tripleProfileChoice === "custom" && (
-                      <label>
-                        User ID (manual)
-                        <input
-                          value={editTripleUserId}
-                          onChange={(e) => setEditTripleUserId(e.target.value)}
-                        />
-                      </label>
-                    )}
-                  </>
+                  <label>
+                    Short-term хвост (сообщений user+assistant)
+                    <input
+                      type="number"
+                      min={1}
+                      value={editTripleTail}
+                      onChange={(e) => setEditTripleTail(e.target.value)}
+                    />
+                  </label>
+                )}
+                <label>
+                  Профиль / user_id (инварианты для всех стратегий; long-term при triple)
+                  <select
+                    value={tripleProfileChoice}
+                    onChange={(e) => {
+                      const choice = e.target.value;
+                      setTripleProfileChoice(choice);
+                      const picked = memoryProfiles.find((p) => p.id === choice);
+                      if (picked) setEditTripleUserId(picked.user_id);
+                    }}
+                  >
+                    {memoryProfiles.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.title}
+                      </option>
+                    ))}
+                    <option value="custom">Пользовательский (manual)</option>
+                  </select>
+                </label>
+                {tripleProfileChoice === "custom" && (
+                  <label>
+                    User ID (manual)
+                    <input
+                      value={editTripleUserId}
+                      onChange={(e) => setEditTripleUserId(e.target.value)}
+                    />
+                  </label>
                 )}
                 <label>
                   System prompt
@@ -1202,15 +1309,33 @@ export default function App() {
                   >
                     Долговременная
                   </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={memoryTab === "invariants"}
+                    className={memoryTab === "invariants" ? "active" : ""}
+                    onClick={() => {
+                      setMemoryTab("invariants");
+                      setEditTarget(null);
+                      void loadInvariantList();
+                    }}
+                  >
+                    Инварианты
+                  </button>
                 </div>
                 <div className="memory-panel-body">
                   <input
                     type="search"
                     className="memory-search"
-                    placeholder="Поиск по ключу или значению…"
+                    placeholder={
+                      memoryTab === "invariants"
+                        ? "Поиск по заголовку, тексту, категории…"
+                        : "Поиск по ключу или значению…"
+                    }
                     value={memorySearch}
                     onChange={(e) => setMemorySearch(e.target.value)}
                   />
+                  {(memoryTab === "working" || memoryTab === "long") && (
                   <div className="memory-stats">
                     <div className="memory-stats-row">
                       <span>Всего записей:</span>
@@ -1229,6 +1354,19 @@ export default function App() {
                       <span className="chip">empty: {memoryTypeStats.empty}</span>
                     </div>
                   </div>
+                  )}
+                  {memoryTab === "invariants" && (
+                  <div className="memory-stats">
+                    <div className="memory-stats-row">
+                      <span>Всего инвариантов:</span>
+                      <strong>{invariantItems.length}</strong>
+                    </div>
+                    <div className="memory-stats-row">
+                      <span>По фильтру:</span>
+                      <strong>{filteredInvariantItems.length}</strong>
+                    </div>
+                  </div>
+                  )}
                   {memoryTab === "working" && (
                     <>
                       <p className="memory-hint">
@@ -1591,6 +1729,170 @@ export default function App() {
                             className="btn primary"
                             disabled={loading || !newLmKey.trim()}
                             onClick={() => void handleAddLongTerm()}
+                          >
+                            Добавить
+                          </button>
+                        </div>
+                      </details>
+                    </>
+                  )}
+                  {memoryTab === "invariants" && (
+                    <>
+                      <p className="memory-hint">
+                        Инварианты по <code>user_id</code> (таблица <code>invariants</code>), отдельно от
+                        диалога. В запрос ассистенту подставляются из настроек ветки — поле «Профиль /
+                        user_id» (тот же <code>user_id</code>, что для долговременной памяти).
+                      </p>
+                      <div className="memory-lt-user">
+                        <label>
+                          Профиль
+                          <select
+                            value={ltProfileChoice}
+                            onChange={(e) => {
+                              const choice = e.target.value;
+                              setLtProfileChoice(choice);
+                              const picked = memoryProfiles.find((p) => p.id === choice);
+                              if (picked) setMemoryLtUserId(picked.user_id);
+                            }}
+                          >
+                            {memoryProfiles.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.title}
+                              </option>
+                            ))}
+                            <option value="custom">Пользовательский (manual)</option>
+                          </select>
+                        </label>
+                        {ltProfileChoice === "custom" && (
+                          <label>
+                            User ID (manual)
+                            <input
+                              value={memoryLtUserId}
+                              onChange={(e) =>
+                                setMemoryLtUserId(e.target.value)
+                              }
+                            />
+                          </label>
+                        )}
+                        <button
+                          type="button"
+                          className="btn primary"
+                          disabled={loading}
+                          onClick={() => void loadInvariantList()}
+                        >
+                          Загрузить
+                        </button>
+                      </div>
+                      {invLoading && (
+                        <p className="memory-status">Загрузка…</p>
+                      )}
+                      {invError && (
+                        <div className="memory-err" role="alert">
+                          {invError}
+                        </div>
+                      )}
+                      {!invLoading &&
+                        !invError &&
+                        filteredInvariantItems.length === 0 && (
+                          <p className="memory-empty">
+                            Нет инвариантов для этого user_id.
+                          </p>
+                        )}
+                      {filteredInvariantItems.length > 0 && (
+                        <div className="memory-table-wrap">
+                          <table className="memory-table">
+                            <thead>
+                              <tr>
+                                <th>Категория</th>
+                                <th>Строгость</th>
+                                <th>Заголовок</th>
+                                <th>Формулировка</th>
+                                <th />
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {filteredInvariantItems.map((row) => (
+                                <tr key={row.id}>
+                                  <td className="memory-key">{row.category}</td>
+                                  <td className="memory-meta">{row.severity}</td>
+                                  <td className="memory-key">{row.title}</td>
+                                  <td className="memory-val">
+                                    <span className="memory-val-text">
+                                      {row.statement}
+                                    </span>
+                                  </td>
+                                  <td className="memory-actions">
+                                    <button
+                                      type="button"
+                                      className="btn"
+                                      disabled={loading}
+                                      onClick={() =>
+                                        void handleDeleteInvariant(row.id)
+                                      }
+                                    >
+                                      Удал.
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                      <details className="memory-add-details">
+                        <summary>Добавить инвариант</summary>
+                        <div className="memory-add">
+                          <label>
+                            Категория
+                            <select
+                              value={newInvCategory}
+                              onChange={(e) =>
+                                setNewInvCategory(e.target.value)
+                              }
+                            >
+                              {INVARIANT_CATEGORY_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>
+                                  {o.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Строгость
+                            <select
+                              value={newInvSeverity}
+                              onChange={(e) =>
+                                setNewInvSeverity(e.target.value)
+                              }
+                            >
+                              {INVARIANT_SEVERITY_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>
+                                  {o.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <input
+                            placeholder="Краткий заголовок"
+                            value={newInvTitle}
+                            onChange={(e) => setNewInvTitle(e.target.value)}
+                          />
+                          <textarea
+                            placeholder="Формулировка правила"
+                            value={newInvStatement}
+                            onChange={(e) =>
+                              setNewInvStatement(e.target.value)
+                            }
+                          />
+                          <button
+                            type="button"
+                            className="btn primary"
+                            disabled={
+                              loading ||
+                              !newInvTitle.trim() ||
+                              !newInvStatement.trim()
+                            }
+                            onClick={() => void handleAddInvariant()}
                           >
                             Добавить
                           </button>

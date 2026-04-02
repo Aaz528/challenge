@@ -9,7 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app_settings import MEMORY_PROFILE_PRESETS, MEMORY_STRATEGIES, SETTINGS, WEB_SETTINGS
+from app_settings import (
+    INVARIANT_CATEGORIES,
+    INVARIANT_SEVERITIES,
+    MEMORY_PROFILE_PRESETS,
+    MEMORY_STRATEGIES,
+    SETTINGS,
+    WEB_SETTINGS,
+)
 from chat_service import (
     TaskFSMState,
     pause_task_fsm,
@@ -21,7 +28,7 @@ from chat_service import (
     transition_task_fsm,
     get_task_fsm_state,
 )
-from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
+from sqlite_chat_storage import BranchInfo, InvariantRow, SQLiteChatStorage
 
 from api.deps import get_storage
 
@@ -118,6 +125,32 @@ class PauseTaskBody(BaseModel):
     reason: str | None = None
 
 
+class InvariantOut(BaseModel):
+    id: int
+    user_id: str
+    category: str
+    severity: str
+    title: str
+    statement: str
+    active: bool
+    updated_at: str
+
+
+class InvariantCreateBody(BaseModel):
+    category: str
+    severity: str
+    title: str
+    statement: str
+
+
+class InvariantPatchBody(BaseModel):
+    category: str | None = None
+    severity: str | None = None
+    title: str | None = None
+    statement: str | None = None
+    active: bool | None = None
+
+
 class ForkBody(BaseModel):
     fork_after_message_id: int = Field(..., description="ID сообщения в текущей ветке — история до него включительно копируется")
     title: str = "Новая ветка"
@@ -184,6 +217,33 @@ def _task_out(state: TaskFSMState) -> TaskFSMOut:
         expected_action=state.expected_action,
         previous_stage=state.previous_stage,
         pause_reason=state.pause_reason,
+    )
+
+
+def _normalize_invariant_category(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    if s not in INVARIANT_CATEGORIES:
+        raise ValueError(f"Неизвестная категория инварианта: {raw!r}")
+    return s
+
+
+def _normalize_invariant_severity(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    if s not in INVARIANT_SEVERITIES:
+        raise ValueError(f"Неизвестная строгость: {raw!r}")
+    return s
+
+
+def _invariant_out(r: InvariantRow) -> InvariantOut:
+    return InvariantOut(
+        id=r.invariant_id,
+        user_id=r.user_id,
+        category=r.category,
+        severity=r.severity,
+        title=r.title,
+        statement=r.statement,
+        active=bool(r.active),
+        updated_at=r.updated_at,
     )
 
 
@@ -505,6 +565,97 @@ def clear_long_term_memory(
         raise HTTPException(status_code=400, detail="Пустой user_id")
     storage.clear_long_term_memory(uid)
     return {"ok": True}
+
+
+@app.get("/api/users/{user_id}/invariants", response_model=list[InvariantOut])
+def list_invariants_api(
+    user_id: str,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> list[InvariantOut]:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    rows = storage.list_invariants(uid, active_only=True)
+    return [_invariant_out(r) for r in rows]
+
+
+@app.post("/api/users/{user_id}/invariants", response_model=InvariantOut)
+def create_invariant_api(
+    user_id: str,
+    body: InvariantCreateBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> InvariantOut:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    try:
+        cat = _normalize_invariant_category(body.category)
+        sev = _normalize_invariant_severity(body.severity)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    title = body.title.strip()
+    statement = body.statement.strip()
+    if not title or not statement:
+        raise HTTPException(status_code=400, detail="Заполните title и statement")
+    iid = storage.create_invariant(uid, category=cat, severity=sev, title=title, statement=statement)
+    r = storage.get_invariant(uid, iid)
+    if not r:
+        raise HTTPException(status_code=500, detail="Не удалось создать инвариант")
+    return _invariant_out(r)
+
+
+@app.patch("/api/users/{user_id}/invariants/{invariant_id}", response_model=InvariantOut)
+def patch_invariant_api(
+    user_id: str,
+    invariant_id: int,
+    body: InvariantPatchBody,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> InvariantOut:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    try:
+        cat = _normalize_invariant_category(body.category) if body.category is not None else None
+        sev = _normalize_invariant_severity(body.severity) if body.severity is not None else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    title = body.title.strip() if body.title is not None else None
+    statement = body.statement.strip() if body.statement is not None else None
+    if title is not None and not title:
+        raise HTTPException(status_code=400, detail="Пустой title")
+    if statement is not None and not statement:
+        raise HTTPException(status_code=400, detail="Пустой statement")
+    active_i: int | None = None
+    if body.active is not None:
+        active_i = 1 if body.active else 0
+    storage.update_invariant(
+        uid,
+        invariant_id,
+        category=cat,
+        severity=sev,
+        title=title,
+        statement=statement,
+        active=active_i,
+    )
+    r = storage.get_invariant(uid, invariant_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Инвариант не найден")
+    return _invariant_out(r)
+
+
+@app.delete("/api/users/{user_id}/invariants/{invariant_id}")
+def delete_invariant_api(
+    user_id: str,
+    invariant_id: int,
+    storage: SQLiteChatStorage = Depends(get_storage),
+) -> dict[str, bool]:
+    uid = user_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Пустой user_id")
+    deleted = storage.delete_invariant(uid, invariant_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Инвариант не найден")
+    return {"deleted": True}
 
 
 @app.post("/api/chats/{chat_id}/branches/{parent_branch_id}/fork", response_model=BranchOut)

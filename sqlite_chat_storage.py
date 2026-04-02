@@ -45,6 +45,18 @@ class MemoryKVRow:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class InvariantRow:
+    invariant_id: int
+    user_id: str
+    category: str
+    severity: str
+    title: str
+    statement: str
+    active: int
+    updated_at: str
+
+
 class SQLiteChatStorage:
     def __init__(self, db_path: str = "chats.db") -> None:
         self._db_path = Path(db_path)
@@ -180,6 +192,25 @@ class SQLiteChatStorage:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_long_term_memory_user ON long_term_memory(user_id, mem_key)"
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invariants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                title TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_invariants_user_active ON invariants(user_id, active)"
         )
 
         cur.execute("PRAGMA table_info(branches)")
@@ -847,6 +878,119 @@ class SQLiteChatStorage:
         cur.execute("UPDATE messages SET content=? WHERE id=?", (content, message_id))
         cur.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (chat_id,))
         self._conn.commit()
+
+    def list_invariants(self, user_id: str, *, active_only: bool = True) -> list[InvariantRow]:
+        cur = self._conn.cursor()
+        if active_only:
+            cur.execute(
+                """
+                SELECT id, user_id, category, severity, title, statement, active, updated_at
+                FROM invariants
+                WHERE user_id=? AND active=1
+                ORDER BY category ASC, id ASC
+                """,
+                (user_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, user_id, category, severity, title, statement, active, updated_at
+                FROM invariants
+                WHERE user_id=?
+                ORDER BY id DESC
+                """,
+                (user_id,),
+            )
+        return [
+            InvariantRow(
+                invariant_id=int(r["id"]),
+                user_id=str(r["user_id"]),
+                category=str(r["category"]),
+                severity=str(r["severity"]),
+                title=str(r["title"]),
+                statement=str(r["statement"]),
+                active=int(r["active"]),
+                updated_at=str(r["updated_at"]),
+            )
+            for r in cur.fetchall()
+        ]
+
+    def get_invariant(self, user_id: str, invariant_id: int) -> InvariantRow | None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_id, category, severity, title, statement, active, updated_at
+            FROM invariants WHERE id=? AND user_id=?
+            """,
+            (invariant_id, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return InvariantRow(
+            invariant_id=int(row["id"]),
+            user_id=str(row["user_id"]),
+            category=str(row["category"]),
+            severity=str(row["severity"]),
+            title=str(row["title"]),
+            statement=str(row["statement"]),
+            active=int(row["active"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def create_invariant(
+        self,
+        user_id: str,
+        *,
+        category: str,
+        severity: str,
+        title: str,
+        statement: str,
+    ) -> int:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO invariants (user_id, category, severity, title, statement)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, category, severity, title, statement),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def update_invariant(
+        self,
+        user_id: str,
+        invariant_id: int,
+        *,
+        category: str | None = None,
+        severity: str | None = None,
+        title: str | None = None,
+        statement: str | None = None,
+        active: int | None = None,
+    ) -> None:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            UPDATE invariants SET
+                category = COALESCE(?, category),
+                severity = COALESCE(?, severity),
+                title = COALESCE(?, title),
+                statement = COALESCE(?, statement),
+                active = COALESCE(?, active),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id=? AND user_id=?
+            """,
+            (category, severity, title, statement, active, invariant_id, user_id),
+        )
+        self._conn.commit()
+
+    def delete_invariant(self, user_id: str, invariant_id: int) -> bool:
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM invariants WHERE id=? AND user_id=?", (invariant_id, user_id))
+        deleted = cur.rowcount > 0
+        self._conn.commit()
+        return deleted
 
     def add_tokens(self, chat_id: int, branch_id: int, delta_tokens: int) -> None:
         if delta_tokens <= 0:
