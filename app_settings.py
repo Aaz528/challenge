@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 
 
@@ -36,10 +38,86 @@ class WebSettings:
     cors_origins: tuple[str, ...] = (
         "http://127.0.0.1:5173",
         "http://localhost:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5174",
+        "http://127.0.0.1:5175",
+        "http://localhost:5175",
     )
 
 
 WEB_SETTINGS = WebSettings()
+
+
+@dataclass(frozen=True)
+class MCPSettings:
+    """Подключение MCP-клиента (официальный SDK). Переменные MCP_* — см. load_mcp_settings()."""
+
+    enabled: bool = False
+    # stdio | streamable_http
+    transport: str = ""
+    stdio_command: str = ""
+    stdio_args: tuple[str, ...] = ()
+    streamable_http_url: str = ""
+    # Таймаут HTTP для streamable_http (сек). SDK иначе даёт read до 300s — «висит» при неверном URL.
+    http_timeout_sec: float = 45.0
+    # Заголовки для удалённого MCP (Authorization и т.д.): MCP_STREAMABLE_HTTP_HEADERS_JSON
+    streamable_http_headers: tuple[tuple[str, str], ...] = ()
+
+
+MCP_DEFAULTS = MCPSettings()
+
+
+def _parse_mcp_stdio_args(raw: str) -> list[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError(
+            'MCP_STDIO_ARGS должен быть JSON-массивом строк, например ["-y","@scope/pkg"]'
+        )
+    return [str(x) for x in data]
+
+
+def _parse_mcp_http_headers_json(raw: str) -> tuple[tuple[str, str], ...]:
+    raw = (raw or "").strip()
+    if not raw:
+        return ()
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("MCP_STREAMABLE_HTTP_HEADERS_JSON должен быть JSON-объектом {\"Header-Name\": \"value\"}")
+    out: list[tuple[str, str]] = []
+    for k, v in data.items():
+        out.append((str(k), str(v)))
+    return tuple(out)
+
+
+def load_mcp_settings() -> MCPSettings:
+    """Читает MCP_* из окружения. Не импортирует пакет mcp — безопасно для лёгких эндпоинтов вроде /api/mcp/config."""
+    enabled = os.environ.get("MCP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+    transport = os.environ.get("MCP_TRANSPORT", "").strip().lower()
+    cmd = os.environ.get("MCP_STDIO_COMMAND", "").strip()
+    args_raw = os.environ.get("MCP_STDIO_ARGS", "").strip()
+    url = os.environ.get("MCP_STREAMABLE_HTTP_URL", "").strip()
+    args = _parse_mcp_stdio_args(args_raw)
+    try:
+        http_timeout_sec = float(os.environ.get("MCP_HTTP_TIMEOUT_SEC", "45").strip() or "45")
+    except ValueError:
+        http_timeout_sec = 45.0
+    headers_raw = os.environ.get("MCP_STREAMABLE_HTTP_HEADERS_JSON", "").strip()
+    try:
+        streamable_http_headers = _parse_mcp_http_headers_json(headers_raw)
+    except (json.JSONDecodeError, ValueError):
+        streamable_http_headers = ()
+    return MCPSettings(
+        enabled=enabled,
+        transport=transport,
+        stdio_command=cmd,
+        stdio_args=tuple(args),
+        streamable_http_url=url,
+        http_timeout_sec=http_timeout_sec,
+        streamable_http_headers=streamable_http_headers,
+    )
 
 
 # Стратегии памяти ветки (см. chat_service / sqlite_chat_storage)

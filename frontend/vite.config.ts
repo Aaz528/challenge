@@ -5,8 +5,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    /** Если 5173 занят — завершить с ошибкой, а не молча перейти на другой порт (иначе localhost:5173 может открыть «не тот» процесс). */
-    strictPort: true,
+    /** Если 5173 занят — взять следующий (5174, …). В app_settings CORS добавлены 5173–5175. */
+    strictPort: false,
     proxy: {
       "/api": {
         target: "http://127.0.0.1:8000",

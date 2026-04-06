@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -12,10 +16,12 @@ from pydantic import BaseModel, Field
 from app_settings import (
     INVARIANT_CATEGORIES,
     INVARIANT_SEVERITIES,
+    MCPSettings,
     MEMORY_PROFILE_PRESETS,
     MEMORY_STRATEGIES,
     SETTINGS,
     WEB_SETTINGS,
+    load_mcp_settings,
 )
 from chat_service import (
     TaskFSMState,
@@ -32,6 +38,11 @@ from sqlite_chat_storage import BranchInfo, InvariantRow, SQLiteChatStorage
 
 from api.deps import get_storage
 
+# MCP_* и прочие переменные из .env (без этого только llm_agent подхватывал бы ключи при первом LLM-вызове)
+_project_root = Path(__file__).resolve().parents[1]
+load_dotenv(_project_root / ".env")
+load_dotenv()
+
 app = FastAPI(title="LLM Agent API", version="1.0.0")
 
 app.add_middleware(
@@ -44,6 +55,9 @@ app.add_middleware(
 
 _stream_stop_lock = threading.Lock()
 _stream_stops: dict[tuple[int, int], threading.Event] = {}
+
+# Первый запуск `npx -y @modelcontextprotocol/...` может качать npm-пакеты минуты — ограничиваем ожидание.
+MCP_CONNECT_TIMEOUT_SEC = 180
 
 
 class ChatOut(BaseModel):
@@ -254,6 +268,141 @@ def _sse(event: str, data: dict) -> str:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+class MCPConfigOut(BaseModel):
+    """Снимок настроек клиента MCP (без секретов)."""
+
+    enabled: bool
+    transport: str
+    stdio_command: str
+    streamable_http_url: str
+    http_timeout_sec: float
+    # URL не localhost — удалённый MCP (нагрузка на другом хосте)
+    looks_like_remote_streamable: bool = False
+    streamable_http_headers_configured: bool = False
+    hint: str | None = None
+
+
+def _mcp_url_looks_remote(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    if "127.0.0.1" in u or "localhost" in u:
+        return False
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def _mcp_config_hint(s: MCPSettings) -> str | None:
+    if not s.enabled:
+        return None
+    tr = (s.transport or "").lower()
+    if tr in ("streamable_http", "http", "streamable-http"):
+        u = (s.streamable_http_url or "").strip()
+        if not u:
+            return (
+                "Задайте MCP_STREAMABLE_HTTP_URL — это URL отдельного MCP-сервера (Streamable HTTP), "
+                "а не REST этого API, если вы не монтируете MCP в том же процессе."
+            )
+        port = WEB_SETTINGS.port
+        for needle in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            if needle in u:
+                return (
+                    f"URL указывает на порт {port}. Если там только uvicorn этого приложения и нет endpoint MCP, "
+                    "запрос будет долго ждать или падать. Поднимите MCP на другом порту (например FastMCP) "
+                    "или вернитесь к транспорту stdio."
+                )
+    return None
+
+
+class MCPPingOut(BaseModel):
+    ok: bool
+    message: str
+
+
+class MCPToolsOut(BaseModel):
+    ok: bool
+    tools: list[dict[str, Any]]
+    tool_count: int
+
+
+@app.get("/api/mcp/config", response_model=MCPConfigOut)
+def mcp_config() -> MCPConfigOut:
+    """Показывает, включён ли MCP и какой транспорт ожидается (без установки соединения)."""
+    s = load_mcp_settings()
+    url = s.streamable_http_url
+    if url and len(url) > 24:
+        url = url[:12] + "…" + url[-10:]
+    return MCPConfigOut(
+        enabled=s.enabled,
+        transport=s.transport,
+        stdio_command=s.stdio_command,
+        streamable_http_url=url,
+        http_timeout_sec=s.http_timeout_sec,
+        looks_like_remote_streamable=_mcp_url_looks_remote(s.streamable_http_url),
+        streamable_http_headers_configured=bool(s.streamable_http_headers),
+        hint=_mcp_config_hint(s),
+    )
+
+
+@app.get("/api/mcp/ping", response_model=MCPPingOut)
+async def mcp_ping() -> MCPPingOut:
+    """Проверяет, что сессия MCP поднимается и сервер отвечает на ping."""
+    from mcp_client import session_from_settings
+
+    s = load_mcp_settings()
+    if not s.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="MCP выключен. Задайте MCP_ENABLED=1 и MCP_TRANSPORT (stdio | streamable_http).",
+        )
+    try:
+        async with asyncio.timeout(MCP_CONNECT_TIMEOUT_SEC):
+            async with session_from_settings(s) as session:
+                await session.send_ping()
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"MCP: таймаут {MCP_CONNECT_TIMEOUT_SEC}s. Первый запуск через npx часто долго качает npm-пакеты "
+                "на этой машине. Повторите позже или установите MCP-сервер глобально (`npm i -g …`) и в .env укажите "
+                "прямой бинарник в MCP_STDIO_COMMAND без npx — старт будет быстрее."
+            ),
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {e}") from e
+    return MCPPingOut(ok=True, message="Соединение установлено, ping успешен.")
+
+
+@app.get("/api/mcp/tools", response_model=MCPToolsOut)
+async def mcp_tools() -> MCPToolsOut:
+    """Подключается к MCP-серверу и возвращает список инструментов."""
+    from mcp_client import list_tools_dicts, session_from_settings
+
+    s = load_mcp_settings()
+    if not s.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="MCP выключен. Задайте MCP_ENABLED=1 и параметры транспорта.",
+        )
+    try:
+        async with asyncio.timeout(MCP_CONNECT_TIMEOUT_SEC):
+            async with session_from_settings(s) as session:
+                tools = await list_tools_dicts(session)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"MCP: таймаут {MCP_CONNECT_TIMEOUT_SEC}s — см. подсказку в /api/mcp/ping (npx / первый запуск)."
+            ),
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {e}") from e
+    return MCPToolsOut(ok=True, tools=tools, tool_count=len(tools))
 
 
 @app.get("/api/memory-profiles", response_model=list[MemoryProfileOut])
