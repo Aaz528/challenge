@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -56,8 +57,43 @@ app.add_middleware(
 _stream_stop_lock = threading.Lock()
 _stream_stops: dict[tuple[int, int], threading.Event] = {}
 
-# Первый запуск `npx -y @modelcontextprotocol/...` может качать npm-пакеты минуты — ограничиваем ожидание.
-MCP_CONNECT_TIMEOUT_SEC = 180
+# Таймаут ожидания MCP connect/list-tools (сек).
+# Настраивается через MCP_CONNECT_TIMEOUT_SEC в .env:
+# - > 0: лимит в секундах
+# - 0 или отрицательное: без лимита
+def _mcp_connect_timeout_sec() -> float:
+    raw = os.environ.get("MCP_CONNECT_TIMEOUT_SEC", "180").strip()
+    try:
+        return float(raw or "180")
+    except ValueError:
+        return 180.0
+
+
+def _mcp_error_detail(exc: Exception) -> str:
+    """
+    Разворачивает ExceptionGroup/TaskGroup ошибки в читаемую причину.
+    Иначе пользователю приходит бесполезное "unhandled errors in a TaskGroup".
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    parts: list[str] = []
+    while stack:
+        cur = stack.pop()
+        obj_id = id(cur)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        msg = str(cur).strip()
+        name = cur.__class__.__name__
+        if msg:
+            parts.append(f"{name}: {msg}")
+        # ExceptionGroup (py3.11+) / anyio task groups
+        sub = getattr(cur, "exceptions", None)
+        if isinstance(sub, tuple):
+            stack.extend(sub)
+    if not parts:
+        return str(exc)
+    return " | ".join(parts[:4])
 
 
 class ChatOut(BaseModel):
@@ -356,15 +392,20 @@ async def mcp_ping() -> MCPPingOut:
             status_code=503,
             detail="MCP выключен. Задайте MCP_ENABLED=1 и MCP_TRANSPORT (stdio | streamable_http).",
         )
+    timeout_sec = _mcp_connect_timeout_sec()
     try:
-        async with asyncio.timeout(MCP_CONNECT_TIMEOUT_SEC):
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_settings(s) as session:
+                    await session.send_ping()
+        else:
             async with session_from_settings(s) as session:
                 await session.send_ping()
     except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail=(
-                f"MCP: таймаут {MCP_CONNECT_TIMEOUT_SEC}s. Первый запуск через npx часто долго качает npm-пакеты "
+                f"MCP: таймаут {timeout_sec:g}s. Первый запуск через npx часто долго качает npm-пакеты "
                 "на этой машине. Повторите позже или установите MCP-сервер глобально (`npm i -g …`) и в .env укажите "
                 "прямой бинарник в MCP_STDIO_COMMAND без npx — старт будет быстрее."
             ),
@@ -372,7 +413,7 @@ async def mcp_ping() -> MCPPingOut:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"MCP: {e}") from e
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
     return MCPPingOut(ok=True, message="Соединение установлено, ping успешен.")
 
 
@@ -387,21 +428,26 @@ async def mcp_tools() -> MCPToolsOut:
             status_code=503,
             detail="MCP выключен. Задайте MCP_ENABLED=1 и параметры транспорта.",
         )
+    timeout_sec = _mcp_connect_timeout_sec()
     try:
-        async with asyncio.timeout(MCP_CONNECT_TIMEOUT_SEC):
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_settings(s) as session:
+                    tools = await list_tools_dicts(session)
+        else:
             async with session_from_settings(s) as session:
                 tools = await list_tools_dicts(session)
     except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail=(
-                f"MCP: таймаут {MCP_CONNECT_TIMEOUT_SEC}s — см. подсказку в /api/mcp/ping (npx / первый запуск)."
+                f"MCP: таймаут {timeout_sec:g}s — см. подсказку в /api/mcp/ping (npx / первый запуск)."
             ),
         ) from None
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"MCP: {e}") from e
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
     return MCPToolsOut(ok=True, tools=tools, tool_count=len(tools))
 
 

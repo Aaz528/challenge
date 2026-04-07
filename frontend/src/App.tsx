@@ -1025,7 +1025,7 @@ export default function App() {
                   {editStrategy === "sticky_facts" &&
                     "После каждого сообщения пользователя обновляется блок фактов; в промпт идут факты + хвост диалога."}
                   {editStrategy === "triple_memory" &&
-                    "Контекст собирается из short-term диалога, working memory ветки и long-term памяти пользователя."}
+                    "Контекст собирается из short-term диалога, working memory ветки и long-term памяти пользователя. Если на сервере включён MCP (MCP_ENABLED), к тем же инструментам wm_* добавляются tools с подключённого MCP-сервера (например погода)."}
                 </p>
                 {editStrategy === "sliding_window" && (
                   <label>

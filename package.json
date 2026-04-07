@@ -1,0 +1,9 @@
+{
+  "name": "challenge-mcp-runner",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Local helper to run MCP filesystem server without npx runtime lookup",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "^2025.12.18"
+  }
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from app_settings import (
     MEMORY_STRATEGY_TRIPLE,
     SETTINGS,
     SUMMARY_SETTINGS,
+    load_mcp_settings,
 )
 from llm_agent import LLMAgent, LLMConfig, ToolCallSpec
 from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
@@ -327,14 +329,21 @@ def build_triple_context(
     wm = storage.list_working_memory(branch_id)
     lm = storage.list_long_term_memory(user_id)
 
+    wm_block = (
+        "Рабочая память (текущая задача, можно изменять через tools wm_*):\n"
+        + _stringify_kv(wm)
+    )
+    if load_mcp_settings().enabled:
+        wm_block += (
+            "\n\nДополнительно доступны инструменты MCP (например погода Open-Meteo): "
+            "вызывай их через tool_calls, когда нужны актуальные данные с внешнего API."
+        )
+
     out: list[dict[str, str]] = [
         {"role": "system", "content": b.system_prompt},
         {
             "role": "system",
-            "content": (
-                "Рабочая память (текущая задача, можно изменять через tools):\n"
-                + _stringify_kv(wm)
-            ),
+            "content": wm_block,
         },
         {
             "role": "system",
@@ -422,6 +431,77 @@ def _execute_working_memory_tool(
         storage.clear_working_memory(branch_id)
         return {"ok": True}
     return {"ok": False, "error": f"неизвестный tool: {tool_name}"}
+
+
+_mcp_tool_specs_cache: list[ToolCallSpec] | None = None
+
+
+def _get_mcp_tool_specs_for_agent() -> list[ToolCallSpec]:
+    """Схемы инструментов с MCP-сервера (кэш на процесс после первого успешного list_tools)."""
+    global _mcp_tool_specs_cache
+    s = load_mcp_settings()
+    if not s.enabled:
+        return []
+    if _mcp_tool_specs_cache is not None:
+        return _mcp_tool_specs_cache
+
+    from mcp_client import list_tools_dicts, session_from_settings
+
+    async def _list() -> list[dict]:
+        async with session_from_settings(s) as session:
+            return await list_tools_dicts(session)
+
+    try:
+        raw = asyncio.run(_list())
+    except Exception:
+        return []
+
+    out: list[ToolCallSpec] = []
+    for t in raw:
+        name = str(t.get("name", "")).strip()
+        if not name:
+            continue
+        schema = t.get("inputSchema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}, "additionalProperties": True}
+        out.append(
+            ToolCallSpec(
+                name=name,
+                description=str(t.get("description") or "")[:8000],
+                parameters=schema,
+            )
+        )
+    _mcp_tool_specs_cache = out
+    return out
+
+
+def _triple_memory_tools() -> list[ToolCallSpec]:
+    return _working_memory_tools() + _get_mcp_tool_specs_for_agent()
+
+
+def _execute_triple_tool(
+    storage: SQLiteChatStorage, branch_id: int, tool_name: str, args: dict
+) -> dict:
+    if tool_name.startswith("wm_"):
+        return _execute_working_memory_tool(storage, branch_id, tool_name, args)
+    return _execute_mcp_tool_call(tool_name, args)
+
+
+def _execute_mcp_tool_call(tool_name: str, args: dict) -> dict:
+    if not load_mcp_settings().enabled:
+        return {"ok": False, "error": "MCP выключен (MCP_ENABLED)."}
+    from mcp_client import call_tool_text, session_from_settings
+
+    async def _call() -> dict:
+        s = load_mcp_settings()
+        async with session_from_settings(s) as session:
+            text, is_err = await call_tool_text(session, tool_name, args)
+            return {"ok": not is_err, "result": text, "tool": tool_name}
+
+    try:
+        return asyncio.run(_call())
+    except Exception as e:
+        return {"ok": False, "error": str(e), "tool": tool_name}
 
 
 def build_unsummarized_turns(
@@ -559,8 +639,8 @@ def send_message(
         ctx = build_triple_context(storage, chat_id, branch_id, params)
         result = agent.complete_with_tools(
             ctx,
-            tools=_working_memory_tools(),
-            tool_executor=lambda n, a: _execute_working_memory_tool(storage, branch_id, n, a),
+            tools=_triple_memory_tools(),
+            tool_executor=lambda n, a: _execute_triple_tool(storage, branch_id, n, a),
         )
         storage.append_message(chat_id, branch_id, "assistant", result.text)
         total_llm_tokens = 0
@@ -636,8 +716,8 @@ def send_message_stream(
         seen_delta = False
         for ev in agent.complete_with_tools_stream_events(
             ctx,
-            tools=_working_memory_tools(),
-            tool_executor=lambda n, a: _execute_working_memory_tool(storage, branch_id, n, a),
+            tools=_triple_memory_tools(),
+            tool_executor=lambda n, a: _execute_triple_tool(storage, branch_id, n, a),
             should_stop=should_stop,
         ):
             if ev.type == "delta" and ev.delta is not None:
