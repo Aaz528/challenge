@@ -10,6 +10,7 @@ import {
   fetchBranchFacts,
   fetchBranches,
   fetchChats,
+  fetchIrkutskWeather,
   fetchInvariants,
   fetchLongTermMemory,
   fetchMemoryProfiles,
@@ -32,6 +33,7 @@ import {
   type MemoryItem,
   type MemoryProfile,
   type TaskFSM,
+  type WeatherPopup,
   type Message,
 } from "./api";
 import "./App.css";
@@ -160,6 +162,11 @@ export default function App() {
   const [streamStatus, setStreamStatus] = useState("");
   const [streamPhase, setStreamPhase] = useState<StreamPhase>("idle");
   const [canResumeAnswer, setCanResumeAnswer] = useState(false);
+  const [weatherPopupOpen, setWeatherPopupOpen] = useState(false);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
+  const [weatherData, setWeatherData] = useState<WeatherPopup | null>(null);
+  const [lastWeatherAt, setLastWeatherAt] = useState<number>(0);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
@@ -359,6 +366,34 @@ export default function App() {
       .then((f) => setFactsPreview(JSON.stringify(f, null, 2)))
       .catch(() => setFactsPreview("(не удалось загрузить)"));
   }, [showSettings, activeChatId, activeBranchId, editStrategy]);
+
+  const openWeatherPopup = useCallback(async () => {
+    setWeatherLoading(true);
+    setWeatherError(null);
+    setWeatherPopupOpen(true);
+    try {
+      const data = await fetchIrkutskWeather();
+      setWeatherData(data);
+      setLastWeatherAt(Date.now());
+    } catch (e: unknown) {
+      setWeatherError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWeatherLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Автопоказ раз в час, пока приложение открыто.
+    if (activeChatId == null) return;
+    const hourMs = 60 * 60 * 1000;
+    const id = window.setInterval(() => {
+      const now = Date.now();
+      if (now - lastWeatherAt >= hourMs) {
+        void openWeatherPopup();
+      }
+    }, 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [activeChatId, lastWeatherAt, openWeatherPopup]);
 
   const handleNewChat = async () => {
     setError(null);
@@ -997,6 +1032,14 @@ export default function App() {
                 onClick={() => setShowMemoryPanel((s) => !s)}
               >
                 Память
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void openWeatherPopup()}
+                disabled={loading || weatherLoading}
+              >
+                Погода (Иркутск)
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -1903,6 +1946,49 @@ export default function App() {
                 </div>
               </aside>
             )}
+          </div>
+        )}
+        {weatherPopupOpen && (
+          <div className="modal-backdrop" role="presentation">
+            <div className="modal">
+              <h3>Погода в Иркутске</h3>
+              <p className="hint">
+                Автопоказ раз в час, пока открыт интерфейс агента. Можно открыть вручную кнопкой в тулбаре.
+              </p>
+              {weatherLoading && <p>Загрузка...</p>}
+              {!weatherLoading && weatherError && (
+                <div className="memory-err" role="alert">
+                  {weatherError}
+                </div>
+              )}
+              {!weatherLoading && !weatherError && weatherData && (
+                <div className="weather-popup-grid">
+                  <div><strong>Город:</strong> {weatherData.city}</div>
+                  <div><strong>Температура:</strong> {weatherData.temperature_c}°C</div>
+                  <div><strong>Ветер:</strong> {weatherData.wind_speed_kmh} км/ч</div>
+                  <div><strong>Код погоды:</strong> {weatherData.weather_code}</div>
+                  <div><strong>Локальное время:</strong> {weatherData.time_local}</div>
+                  <div><strong>Источник:</strong> {weatherData.source}</div>
+                </div>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setWeatherPopupOpen(false)}
+                >
+                  Закрыть
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => void openWeatherPopup()}
+                  disabled={weatherLoading}
+                >
+                  Обновить
+                </button>
+              </div>
+            </div>
           </div>
         )}
         {forkAfterId != null && (

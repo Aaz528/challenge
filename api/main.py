@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -304,6 +305,147 @@ def _sse(event: str, data: dict) -> str:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+class WeatherPopupOut(BaseModel):
+    city: str
+    temperature_c: float
+    wind_speed_kmh: float
+    weather_code: int
+    time_local: str
+    source: str = "open-meteo.com"
+
+
+# Иркутск (центр города), для Yandex Weather API
+_IRKUTSK_LAT = 52.2869741
+_IRKUTSK_LON = 104.3050183
+
+# Условные коды WMO-подобные для отображения (как у wttr); см. документацию Yandex fact.condition
+_YANDEX_CONDITION_TO_WMO: dict[str, int] = {
+    "clear": 0,
+    "partly-cloudy": 2,
+    "cloudy": 3,
+    "overcast": 3,
+    "partly-cloudy-and-light-rain": 61,
+    "partly-cloudy-and-rain": 63,
+    "overcast-and-rain": 65,
+    "overcast-thunderstorms-with-rain": 95,
+    "cloudy-and-light-rain": 61,
+    "overcast-and-light-rain": 61,
+    "cloudy-and-rain": 63,
+    "overcast-and-wet-snow": 69,
+    "partly-cloudy-and-light-snow": 71,
+    "partly-cloudy-and-snow": 73,
+    "overcast-and-snow": 75,
+    "cloudy-and-light-snow": 71,
+    "overcast-and-light-snow": 73,
+    "cloudy-and-snow": 73,
+}
+
+
+def _weather_from_yandex() -> WeatherPopupOut:
+    key = os.environ.get("YANDEX_WEATHER_KEY", "").strip()
+    if not key:
+        raise ValueError("YANDEX_WEATHER_KEY не задан")
+    r = requests.get(
+        "https://api.weather.yandex.ru/v1/forecast",
+        params={
+            "lat": _IRKUTSK_LAT,
+            "lon": _IRKUTSK_LON,
+            "lang": "ru_RU",
+            "limit": 1,
+            "hours": "false",
+        },
+        headers={"X-Yandex-Weather-Key": key},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    fact = data.get("fact") if isinstance(data, dict) else None
+    if not isinstance(fact, dict):
+        raise ValueError("Нет поля fact")
+    temp = float(fact["temp"])
+    wind_ms = float(fact.get("wind_speed") or 0.0)
+    wind_kmh = wind_ms * 3.6
+    cond = fact.get("condition")
+    code = _YANDEX_CONDITION_TO_WMO.get(str(cond), -1) if cond is not None else -1
+    obs = fact.get("obs_time")
+    if isinstance(obs, (int, float)) and obs > 0:
+        t_local = datetime.utcfromtimestamp(int(obs)).strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        t_local = str(data.get("now_dt") or "")
+    return WeatherPopupOut(
+        city="Иркутск",
+        temperature_c=temp,
+        wind_speed_kmh=wind_kmh,
+        weather_code=code,
+        time_local=t_local,
+        source="api.weather.yandex.ru",
+    )
+
+
+def _weather_from_wttr() -> WeatherPopupOut:
+    r2 = requests.get("https://wttr.in/Irkutsk", params={"format": "j1"}, timeout=20)
+    r2.raise_for_status()
+    data2 = r2.json()
+    cur = data2.get("current_condition") if isinstance(data2, dict) else None
+    first = cur[0] if isinstance(cur, list) and cur else None
+    if not isinstance(first, dict):
+        raise ValueError("Некорректный ответ current_condition")
+    temp = float(first.get("temp_C"))
+    wind = float(first.get("windspeedKmph"))
+    code = int(first.get("weatherCode"))
+    t_local = str(first.get("localObsDateTime") or first.get("observation_time") or "")
+    return WeatherPopupOut(
+        city="Иркутск",
+        temperature_c=temp,
+        wind_speed_kmh=wind,
+        weather_code=code,
+        time_local=t_local,
+        source="wttr.in",
+    )
+
+
+_weather_cache_irkutsk: WeatherPopupOut | None = None
+
+
+@app.get("/api/weather/irkutsk", response_model=WeatherPopupOut)
+def get_weather_irkutsk() -> WeatherPopupOut:
+    """Погода в Иркутске: при YANDEX_WEATHER_KEY — Яндекс, иначе wttr.in; при сбоях — кеш или заглушка."""
+    global _weather_cache_irkutsk
+    try:
+        key = os.environ.get("YANDEX_WEATHER_KEY", "").strip()
+        if key:
+            out = _weather_from_yandex()
+        else:
+            out = _weather_from_wttr()
+        _weather_cache_irkutsk = out
+        return out
+    except Exception:
+        try:
+            out = _weather_from_wttr()
+            _weather_cache_irkutsk = out
+            return out
+        except Exception as e2:
+            if _weather_cache_irkutsk is not None:
+                # Отдаём последнее успешное значение, чтобы попап не ломал UX.
+                return WeatherPopupOut(
+                    city=_weather_cache_irkutsk.city,
+                    temperature_c=_weather_cache_irkutsk.temperature_c,
+                    wind_speed_kmh=_weather_cache_irkutsk.wind_speed_kmh,
+                    weather_code=_weather_cache_irkutsk.weather_code,
+                    time_local=_weather_cache_irkutsk.time_local,
+                    source=f"{_weather_cache_irkutsk.source} (cached)",
+                )
+            # Совсем без сети: отдаём нейтральный fallback вместо ошибки.
+            return WeatherPopupOut(
+                city="Иркутск",
+                temperature_c=0.0,
+                wind_speed_kmh=0.0,
+                weather_code=-1,
+                time_local=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                source=f"fallback (network unavailable: {e2.__class__.__name__})",
+            )
 
 
 class MCPConfigOut(BaseModel):

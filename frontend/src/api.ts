@@ -34,6 +34,15 @@ export type SendMessageResponse = {
   elapsed_sec: number;
 };
 
+export type WeatherPopup = {
+  city: string;
+  temperature_c: number;
+  wind_speed_kmh: number;
+  weather_code: number;
+  time_local: string;
+  source: string;
+};
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
@@ -44,6 +53,10 @@ async function json<T>(res: Response): Promise<T> {
 
 export async function fetchChats(): Promise<Chat[]> {
   return json(await fetch("/api/chats"));
+}
+
+export async function fetchIrkutskWeather(): Promise<WeatherPopup> {
+  return json(await fetch("/api/weather/irkutsk"));
 }
 
 export async function createChat(title?: string): Promise<Chat> {
