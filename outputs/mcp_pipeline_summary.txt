@@ -1,0 +1,15 @@
+{
+  "summary": "Сейчас: 0°C, condition=overcast, ветер=4.4 м/с | 2026-04-09: overcast-and-wet-snow, днем 5°C | 2026-04-10: overcast-and-wet-snow, днем -1°C | 2026-04-11: cloudy, днем 12°C | 2026-04-12: partly-cloudy, днем 14°C",
+  "key_points": [
+    "Сейчас: 0°C, condition=overcast, ветер=4.4 м/с",
+    "2026-04-09: overcast-and-wet-snow, днем 5°C",
+    "2026-04-10: overcast-and-wet-snow, днем -1°C",
+    "2026-04-11: cloudy, днем 12°C",
+    "2026-04-12: partly-cloudy, днем 14°C"
+  ],
+  "stats": {
+    "input_items": 5,
+    "used_points": 5,
+    "max_chars": 500
+  }
+}

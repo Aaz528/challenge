@@ -504,6 +504,31 @@ class MCPToolsOut(BaseModel):
     tool_count: int
 
 
+class MCPPipelineBody(BaseModel):
+    query: str
+    limit: int = Field(default=5, ge=1, le=20)
+    max_chars: int = Field(default=500, ge=80, le=6000)
+    max_points: int = Field(default=5, ge=1, le=20)
+    output_file: str = "outputs/mcp_pipeline_summary.txt"
+    overwrite: bool = True
+
+
+class MCPPipelineOut(BaseModel):
+    ok: bool
+    query: str
+    search_raw: str
+    summarize_raw: str
+    save_raw: str
+
+
+def _parse_json_text_or_none(raw: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 @app.get("/api/mcp/config", response_model=MCPConfigOut)
 def mcp_config() -> MCPConfigOut:
     """Показывает, включён ли MCP и какой транспорт ожидается (без установки соединения)."""
@@ -591,6 +616,132 @@ async def mcp_tools() -> MCPToolsOut:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
     return MCPToolsOut(ok=True, tools=tools, tool_count=len(tools))
+
+
+@app.post("/api/mcp/edu-pipeline", response_model=MCPPipelineOut)
+async def mcp_edu_pipeline(body: MCPPipelineBody) -> MCPPipelineOut:
+    """Учебный прогон MCP-пайплайна: search -> summarize -> saveToFile."""
+    from mcp_client import call_tool_text, session_from_settings
+
+    s = load_mcp_settings()
+    if not s.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="MCP выключен. Задайте MCP_ENABLED=1 и параметры транспорта.",
+        )
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query не может быть пустым")
+
+    timeout_sec = _mcp_connect_timeout_sec()
+    try:
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_settings(s) as session:
+                    search_raw, search_err = await call_tool_text(
+                        session,
+                        "search",
+                        {"query": query, "limit": int(body.limit)},
+                    )
+                    if search_err:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"MCP tool search failed: {search_raw or 'unknown error'}",
+                        )
+                    summarize_raw, summarize_err = await call_tool_text(
+                        session,
+                        "summarize",
+                        {
+                            "search_result": search_raw,
+                            "max_chars": int(body.max_chars),
+                            "max_points": int(body.max_points),
+                        },
+                    )
+                    if summarize_err:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"MCP tool summarize failed: {summarize_raw or 'unknown error'}",
+                        )
+                    # Сохраняем сырой результат summarize, чтобы видеть полный JSON шага.
+                    save_raw, save_err = await call_tool_text(
+                        session,
+                        "saveToFile",
+                        {
+                            "content": summarize_raw,
+                            "file_path": body.output_file,
+                            "overwrite": bool(body.overwrite),
+                        },
+                    )
+                    if save_err:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"MCP tool saveToFile failed: {save_raw or 'unknown error'}",
+                        )
+        else:
+            async with session_from_settings(s) as session:
+                search_raw, search_err = await call_tool_text(
+                    session,
+                    "search",
+                    {"query": query, "limit": int(body.limit)},
+                )
+                if search_err:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"MCP tool search failed: {search_raw or 'unknown error'}",
+                    )
+                summarize_raw, summarize_err = await call_tool_text(
+                    session,
+                    "summarize",
+                    {
+                        "search_result": search_raw,
+                        "max_chars": int(body.max_chars),
+                        "max_points": int(body.max_points),
+                    },
+                )
+                if summarize_err:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"MCP tool summarize failed: {summarize_raw or 'unknown error'}",
+                    )
+                save_raw, save_err = await call_tool_text(
+                    session,
+                    "saveToFile",
+                    {
+                        "content": summarize_raw,
+                        "file_path": body.output_file,
+                        "overwrite": bool(body.overwrite),
+                    },
+                )
+                if save_err:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"MCP tool saveToFile failed: {save_raw or 'unknown error'}",
+                    )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"MCP: таймаут {timeout_sec:g}s при выполнении edu pipeline.",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
+
+    # Лёгкая проверка структуры, чтобы быстро выявить неверный контракт.
+    if _parse_json_text_or_none(search_raw) is None:
+        raise HTTPException(status_code=502, detail="search вернул не-JSON текст")
+    if _parse_json_text_or_none(summarize_raw) is None:
+        raise HTTPException(status_code=502, detail="summarize вернул не-JSON текст")
+    if _parse_json_text_or_none(save_raw) is None:
+        raise HTTPException(status_code=502, detail="saveToFile вернул не-JSON текст")
+
+    return MCPPipelineOut(
+        ok=True,
+        query=query,
+        search_raw=search_raw,
+        summarize_raw=summarize_raw,
+        save_raw=save_raw,
+    )
 
 
 @app.get("/api/memory-profiles", response_model=list[MemoryProfileOut])

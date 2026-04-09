@@ -24,6 +24,7 @@ import {
   putWorkingMemoryItem,
   resumeTaskFsm,
   resumeMessageStream,
+  runMcpEduPipeline,
   sendMessageStream,
   stopAndPauseMessageStream,
   stopMessageStream,
@@ -32,6 +33,7 @@ import {
   type Invariant,
   type MemoryItem,
   type MemoryProfile,
+  type MCPPipelineResult,
   type TaskFSM,
   type WeatherPopup,
   type Message,
@@ -167,6 +169,12 @@ export default function App() {
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [weatherData, setWeatherData] = useState<WeatherPopup | null>(null);
   const [lastWeatherAt, setLastWeatherAt] = useState<number>(0);
+  const [pipelinePopupOpen, setPipelinePopupOpen] = useState(false);
+  const [pipelineQuery, setPipelineQuery] = useState("Иркутск");
+  const [pipelineFile, setPipelineFile] = useState("outputs/mcp_pipeline_summary.txt");
+  const [pipelineLoading, setPipelineLoading] = useState(false);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [pipelineData, setPipelineData] = useState<MCPPipelineResult | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
@@ -394,6 +402,24 @@ export default function App() {
     }, 60 * 1000);
     return () => window.clearInterval(id);
   }, [activeChatId, lastWeatherAt, openWeatherPopup]);
+
+  const runPipelineDemo = useCallback(async () => {
+    setPipelineLoading(true);
+    setPipelineError(null);
+    setPipelineData(null);
+    try {
+      const out = await runMcpEduPipeline({
+        query: pipelineQuery,
+        output_file: pipelineFile,
+        overwrite: true,
+      });
+      setPipelineData(out);
+    } catch (e: unknown) {
+      setPipelineError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPipelineLoading(false);
+    }
+  }, [pipelineFile, pipelineQuery]);
 
   const handleNewChat = async () => {
     setError(null);
@@ -1040,6 +1066,14 @@ export default function App() {
                 disabled={loading || weatherLoading}
               >
                 Погода (Иркутск)
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setPipelinePopupOpen(true)}
+                disabled={loading || pipelineLoading}
+              >
+                MCP pipeline demo
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -1986,6 +2020,71 @@ export default function App() {
                   disabled={weatherLoading}
                 >
                   Обновить
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {pipelinePopupOpen && (
+          <div className="modal-backdrop" role="presentation">
+            <div className="modal modal-wide">
+              <h3>MCP pipeline demo (Yandex)</h3>
+              <p className="hint">
+                Запускает инструменты MCP по шагам: search → summarize → saveToFile.
+              </p>
+              <label>
+                Query (город из пресетов или lat,lon)
+                <input
+                  value={pipelineQuery}
+                  onChange={(e) => setPipelineQuery(e.target.value)}
+                  placeholder="Иркутск или 52.286974,104.305018"
+                />
+              </label>
+              <label>
+                Куда сохранить summarize JSON
+                <input
+                  value={pipelineFile}
+                  onChange={(e) => setPipelineFile(e.target.value)}
+                  placeholder="outputs/mcp_pipeline_summary.txt"
+                />
+              </label>
+              {pipelineLoading && <p>Выполнение пайплайна...</p>}
+              {!pipelineLoading && pipelineError && (
+                <div className="memory-err" role="alert">
+                  {pipelineError}
+                </div>
+              )}
+              {!pipelineLoading && !pipelineError && pipelineData && (
+                <div className="pipeline-grid">
+                  <div className="pipeline-step">
+                    <h4>1) search</h4>
+                    <pre className="text">{pipelineData.search_raw}</pre>
+                  </div>
+                  <div className="pipeline-step">
+                    <h4>2) summarize</h4>
+                    <pre className="text">{pipelineData.summarize_raw}</pre>
+                  </div>
+                  <div className="pipeline-step">
+                    <h4>3) saveToFile</h4>
+                    <pre className="text">{pipelineData.save_raw}</pre>
+                  </div>
+                </div>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setPipelinePopupOpen(false)}
+                >
+                  Закрыть
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => void runPipelineDemo()}
+                  disabled={pipelineLoading || !pipelineQuery.trim()}
+                >
+                  Запустить
                 </button>
               </div>
             </div>

@@ -43,6 +43,14 @@ export type WeatherPopup = {
   source: string;
 };
 
+export type MCPPipelineResult = {
+  ok: boolean;
+  query: string;
+  search_raw: string;
+  summarize_raw: string;
+  save_raw: string;
+};
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
@@ -57,6 +65,23 @@ export async function fetchChats(): Promise<Chat[]> {
 
 export async function fetchIrkutskWeather(): Promise<WeatherPopup> {
   return json(await fetch("/api/weather/irkutsk"));
+}
+
+export async function runMcpEduPipeline(body: {
+  query: string;
+  limit?: number;
+  max_chars?: number;
+  max_points?: number;
+  output_file?: string;
+  overwrite?: boolean;
+}): Promise<MCPPipelineResult> {
+  return json(
+    await fetch("/api/mcp/edu-pipeline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
 }
 
 export async function createChat(title?: string): Promise<Chat> {
