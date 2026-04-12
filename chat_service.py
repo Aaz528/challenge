@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 
 from app_settings import (
@@ -14,7 +15,8 @@ from app_settings import (
     MEMORY_STRATEGY_TRIPLE,
     SETTINGS,
     SUMMARY_SETTINGS,
-    load_mcp_settings,
+    MCPServerProfile,
+    load_mcp_server_profiles,
 )
 from llm_agent import LLMAgent, LLMConfig, ToolCallSpec
 from sqlite_chat_storage import BranchInfo, SQLiteChatStorage
@@ -333,10 +335,18 @@ def build_triple_context(
         "Рабочая память (текущая задача, можно изменять через tools wm_*):\n"
         + _stringify_kv(wm)
     )
-    if load_mcp_settings().enabled:
+    mcp_profiles = load_mcp_server_profiles()
+    if mcp_profiles:
+        ids = ", ".join(p.id for p in mcp_profiles)
+        prefix_hint = (
+            "Имена инструментов с префиксом сервера: «serverid__имя_инструмента». "
+            if len(mcp_profiles) > 1
+            else ""
+        )
         wm_block += (
-            "\n\nДополнительно доступны инструменты MCP (например погода Open-Meteo): "
-            "вызывай их через tool_calls, когда нужны актуальные данные с внешнего API."
+            f"\n\nДоступны MCP-серверы: {ids}. {prefix_hint}"
+            "Вызывай их через tool_calls, когда нужны данные с внешнего API; "
+            "для сложных задач допускается цепочка из нескольких вызовов подряд."
         )
 
     out: list[dict[str, str]] = [
@@ -436,41 +446,79 @@ def _execute_working_memory_tool(
 _mcp_tool_specs_cache: list[ToolCallSpec] | None = None
 
 
+def _mcp_tool_max_rounds() -> int:
+    """Раунды tool-calling (triple memory). Больше — для цепочек из нескольких MCP-вызовов."""
+    raw = os.environ.get("MCP_TOOL_MAX_ROUNDS", "12").strip()
+    try:
+        return max(4, min(48, int(raw)))
+    except ValueError:
+        return 12
+
+
+def _resolve_mcp_profile_and_tool(
+    tool_name: str, profiles: list[MCPServerProfile]
+) -> tuple[MCPServerProfile, str]:
+    """Сопоставляет имя инструмента агента профилю MCP и реальному имени tool на сервере."""
+    multi = len(profiles) > 1
+    if "__" in tool_name:
+        sid, _, mcp_tool = tool_name.partition("__")
+        sid = sid.strip()
+        mcp_tool = mcp_tool.strip()
+        if not sid or not mcp_tool:
+            raise ValueError("Некорректное имя инструмента (ожидалось serverid__tool)")
+        for p in profiles:
+            if p.id == sid:
+                return p, mcp_tool
+        raise ValueError(f"Неизвестный MCP-сервер в имени инструмента: {sid!r}")
+    if not multi:
+        return profiles[0], tool_name.strip()
+    raise ValueError(
+        "Подключено несколько MCP-серверов: вызывайте инструменты как «serverid__имя_инструмента». "
+        f"Доступные id: {', '.join(p.id for p in profiles)}"
+    )
+
+
 def _get_mcp_tool_specs_for_agent() -> list[ToolCallSpec]:
-    """Схемы инструментов с MCP-сервера (кэш на процесс после первого успешного list_tools)."""
+    """Схемы инструментов со всех зарегистрированных MCP (кэш после первого успешного list_tools)."""
     global _mcp_tool_specs_cache
-    s = load_mcp_settings()
-    if not s.enabled:
+    profiles = load_mcp_server_profiles()
+    if not profiles:
         return []
     if _mcp_tool_specs_cache is not None:
         return _mcp_tool_specs_cache
 
-    from mcp_client import list_tools_dicts, session_from_settings
+    from mcp_client import list_tools_dicts, session_from_profile
 
-    async def _list() -> list[dict]:
-        async with session_from_settings(s) as session:
-            return await list_tools_dicts(session)
+    multi = len(profiles) > 1
+
+    async def _list() -> list[ToolCallSpec]:
+        out: list[ToolCallSpec] = []
+        for p in profiles:
+            async with session_from_profile(p) as session:
+                raw = await list_tools_dicts(session)
+            for t in raw:
+                orig = str(t.get("name", "")).strip()
+                if not orig:
+                    continue
+                name = f"{p.id}__{orig}" if multi else orig
+                schema = t.get("inputSchema")
+                if not isinstance(schema, dict):
+                    schema = {"type": "object", "properties": {}, "additionalProperties": True}
+                prefix = f"[MCP:{p.id}] " if multi else ""
+                out.append(
+                    ToolCallSpec(
+                        name=name,
+                        description=(prefix + str(t.get("description") or ""))[:8000],
+                        parameters=schema,
+                    )
+                )
+        return out
 
     try:
-        raw = asyncio.run(_list())
+        out = asyncio.run(_list())
     except Exception:
         return []
 
-    out: list[ToolCallSpec] = []
-    for t in raw:
-        name = str(t.get("name", "")).strip()
-        if not name:
-            continue
-        schema = t.get("inputSchema")
-        if not isinstance(schema, dict):
-            schema = {"type": "object", "properties": {}, "additionalProperties": True}
-        out.append(
-            ToolCallSpec(
-                name=name,
-                description=str(t.get("description") or "")[:8000],
-                parameters=schema,
-            )
-        )
     _mcp_tool_specs_cache = out
     return out
 
@@ -488,15 +536,25 @@ def _execute_triple_tool(
 
 
 def _execute_mcp_tool_call(tool_name: str, args: dict) -> dict:
-    if not load_mcp_settings().enabled:
-        return {"ok": False, "error": "MCP выключен (MCP_ENABLED)."}
-    from mcp_client import call_tool_text, session_from_settings
+    profiles = load_mcp_server_profiles()
+    if not profiles:
+        return {"ok": False, "error": "MCP выключен (MCP_ENABLED) или список серверов пуст."}
+    try:
+        profile, mcp_tool = _resolve_mcp_profile_and_tool(tool_name, profiles)
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "tool": tool_name}
+    from mcp_client import call_tool_text, session_from_profile
 
     async def _call() -> dict:
-        s = load_mcp_settings()
-        async with session_from_settings(s) as session:
-            text, is_err = await call_tool_text(session, tool_name, args)
-            return {"ok": not is_err, "result": text, "tool": tool_name}
+        async with session_from_profile(profile) as session:
+            text, is_err = await call_tool_text(session, mcp_tool, args)
+            return {
+                "ok": not is_err,
+                "result": text,
+                "tool": tool_name,
+                "mcp_server": profile.id,
+                "mcp_tool": mcp_tool,
+            }
 
     try:
         return asyncio.run(_call())
@@ -641,6 +699,7 @@ def send_message(
             ctx,
             tools=_triple_memory_tools(),
             tool_executor=lambda n, a: _execute_triple_tool(storage, branch_id, n, a),
+            max_rounds=_mcp_tool_max_rounds(),
         )
         storage.append_message(chat_id, branch_id, "assistant", result.text)
         total_llm_tokens = 0
@@ -718,6 +777,7 @@ def send_message_stream(
             ctx,
             tools=_triple_memory_tools(),
             tool_executor=lambda n, a: _execute_triple_tool(storage, branch_id, n, a),
+            max_rounds=_mcp_tool_max_rounds(),
             should_stop=should_stop,
         ):
             if ev.type == "delta" and ev.delta is not None:

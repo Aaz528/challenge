@@ -67,6 +67,155 @@ class MCPSettings:
 MCP_DEFAULTS = MCPSettings()
 
 
+@dataclass(frozen=True)
+class MCPServerProfile:
+    """Один зарегистрированный MCP-сервер (stdio или streamable HTTP)."""
+
+    id: str
+    transport: str
+    stdio_command: str = ""
+    stdio_args: tuple[str, ...] = ()
+    streamable_http_url: str = ""
+    http_timeout_sec: float = 45.0
+    streamable_http_headers: tuple[tuple[str, str], ...] = ()
+
+
+def _mcp_enabled_flag() -> bool:
+    return os.environ.get("MCP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _normalize_mcp_transport(raw: str) -> str:
+    t = (raw or "").strip().lower()
+    if t in ("http", "streamable-http", "streamable_http"):
+        return "streamable_http"
+    return t
+
+
+def _profile_from_json_obj(
+    item: dict,
+    *,
+    index: int,
+    default_stdio_command: str,
+    default_http_timeout: float,
+    default_streamable_headers: tuple[tuple[str, str], ...],
+) -> MCPServerProfile:
+    sid = str(item.get("id", "")).strip()
+    if not sid or not sid.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(
+            f"MCP_SERVERS_JSON[{index}].id должен быть непустым и содержать только буквы, цифры, _ и -"
+        )
+    tr = _normalize_mcp_transport(str(item.get("transport", "")))
+    if tr not in ("stdio", "streamable_http"):
+        raise ValueError(
+            f"MCP_SERVERS_JSON[{index}].transport: ожидается stdio или streamable_http, получено {tr!r}"
+        )
+    cmd = str(item.get("stdio_command", "") or "").strip() or default_stdio_command
+    args_raw = item.get("stdio_args")
+    if args_raw is None and tr == "stdio":
+        raise ValueError(f"MCP_SERVERS_JSON[{index}]: для stdio нужен stdio_args (JSON-массив строк)")
+    args_list: list[str] = []
+    if isinstance(args_raw, list):
+        args_list = [str(x) for x in args_raw]
+    elif args_raw is not None:
+        raise ValueError(f"MCP_SERVERS_JSON[{index}].stdio_args должен быть массивом строк")
+    url = str(item.get("streamable_http_url", "") or "").strip()
+    try:
+        hto = float(item.get("http_timeout_sec", default_http_timeout))
+    except (TypeError, ValueError):
+        hto = default_http_timeout
+    hdr_obj = item.get("streamable_http_headers")
+    if hdr_obj is None:
+        hdr_tuples = default_streamable_headers
+    elif isinstance(hdr_obj, dict):
+        hdr_tuples = tuple((str(k), str(v)) for k, v in hdr_obj.items())
+    else:
+        raise ValueError(f"MCP_SERVERS_JSON[{index}].streamable_http_headers должен быть объектом")
+    if tr == "stdio" and not cmd:
+        raise ValueError(
+            f"MCP_SERVERS_JSON[{index}]: задайте stdio_command или глобальный MCP_STDIO_COMMAND"
+        )
+    if tr == "streamable_http" and not url:
+        raise ValueError(f"MCP_SERVERS_JSON[{index}]: для streamable_http нужен streamable_http_url")
+    return MCPServerProfile(
+        id=sid,
+        transport=tr,
+        stdio_command=cmd,
+        stdio_args=tuple(args_list),
+        streamable_http_url=url,
+        http_timeout_sec=max(5.0, hto),
+        streamable_http_headers=hdr_tuples,
+    )
+
+
+def load_mcp_server_profiles() -> list[MCPServerProfile]:
+    """
+    Список MCP-серверов для агента.
+
+    Если задан MCP_SERVERS_JSON (непустой JSON-массив), используются эти профили.
+    Иначе — один «legacy» профиль из MCP_TRANSPORT / MCP_STDIO_* / MCP_STREAMABLE_HTTP_*.
+    """
+    if not _mcp_enabled_flag():
+        return []
+    raw = os.environ.get("MCP_SERVERS_JSON", "").strip()
+    default_cmd = os.environ.get("MCP_STDIO_COMMAND", "").strip()
+    try:
+        default_http_timeout = float(os.environ.get("MCP_HTTP_TIMEOUT_SEC", "45").strip() or "45")
+    except ValueError:
+        default_http_timeout = 45.0
+    headers_raw = os.environ.get("MCP_STREAMABLE_HTTP_HEADERS_JSON", "").strip()
+    try:
+        default_hdrs = _parse_mcp_http_headers_json(headers_raw)
+    except (json.JSONDecodeError, ValueError):
+        default_hdrs = ()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            hint = ""
+            if raw.strip() == "[":
+                hint = (
+                    " Частая причина: в .env многострочное значение без обёртки — в переменную попадает только «[». "
+                    "Запишите весь JSON в одну строку либо в двойных кавычках с \\n."
+                )
+            raise ValueError(f"MCP_SERVERS_JSON: невалидный JSON: {e}.{hint}") from e
+        if not isinstance(data, list):
+            raise ValueError("MCP_SERVERS_JSON должен быть JSON-массивом объектов")
+        if len(data) == 0:
+            pass
+        else:
+            seen: set[str] = set()
+            out: list[MCPServerProfile] = []
+            for i, item in enumerate(data):
+                if not isinstance(item, dict):
+                    raise ValueError(f"MCP_SERVERS_JSON[{i}] должен быть объектом")
+                p = _profile_from_json_obj(
+                    item,
+                    index=i,
+                    default_stdio_command=default_cmd,
+                    default_http_timeout=default_http_timeout,
+                    default_streamable_headers=default_hdrs,
+                )
+                if p.id in seen:
+                    raise ValueError(f"MCP_SERVERS_JSON: дублируется id {p.id!r}")
+                seen.add(p.id)
+                out.append(p)
+            return out
+    s = load_mcp_settings()
+    if not s.enabled:
+        return []
+    return [
+        MCPServerProfile(
+            id="default",
+            transport=_normalize_mcp_transport(s.transport),
+            stdio_command=s.stdio_command,
+            stdio_args=s.stdio_args,
+            streamable_http_url=s.streamable_http_url,
+            http_timeout_sec=s.http_timeout_sec,
+            streamable_http_headers=s.streamable_http_headers,
+        )
+    ]
+
+
 def _parse_mcp_stdio_args(raw: str) -> list[str]:
     raw = (raw or "").strip()
     if not raw:

@@ -23,6 +23,7 @@ from app_settings import (
     MEMORY_STRATEGIES,
     SETTINGS,
     WEB_SETTINGS,
+    load_mcp_server_profiles,
     load_mcp_settings,
 )
 from chat_service import (
@@ -460,6 +461,9 @@ class MCPConfigOut(BaseModel):
     looks_like_remote_streamable: bool = False
     streamable_http_headers_configured: bool = False
     hint: str | None = None
+    # Несколько серверов (MCP_SERVERS_JSON)
+    mcp_server_ids: list[str] = Field(default_factory=list)
+    mcp_servers_json_configured: bool = False
 
 
 def _mcp_url_looks_remote(url: str) -> bool:
@@ -550,24 +554,25 @@ def mcp_config() -> MCPConfigOut:
 
 @app.get("/api/mcp/ping", response_model=MCPPingOut)
 async def mcp_ping() -> MCPPingOut:
-    """Проверяет, что сессия MCP поднимается и сервер отвечает на ping."""
-    from mcp_client import session_from_settings
+    """Проверяет ping для каждого зарегистрированного MCP-сервера."""
+    from mcp_client import session_from_profile
 
-    s = load_mcp_settings()
-    if not s.enabled:
+    profiles = load_mcp_server_profiles()
+    if not profiles:
         raise HTTPException(
             status_code=503,
-            detail="MCP выключен. Задайте MCP_ENABLED=1 и MCP_TRANSPORT (stdio | streamable_http).",
+            detail="MCP выключен или список серверов пуст. Задайте MCP_ENABLED=1 и MCP_SERVERS_JSON (или legacy MCP_*).",
         )
     timeout_sec = _mcp_connect_timeout_sec()
     try:
-        if timeout_sec > 0:
-            async with asyncio.timeout(timeout_sec):
-                async with session_from_settings(s) as session:
+        for p in profiles:
+            if timeout_sec > 0:
+                async with asyncio.timeout(timeout_sec):
+                    async with session_from_profile(p) as session:
+                        await session.send_ping()
+            else:
+                async with session_from_profile(p) as session:
                     await session.send_ping()
-        else:
-            async with session_from_settings(s) as session:
-                await session.send_ping()
     except TimeoutError:
         raise HTTPException(
             status_code=504,
@@ -581,29 +586,41 @@ async def mcp_ping() -> MCPPingOut:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
-    return MCPPingOut(ok=True, message="Соединение установлено, ping успешен.")
+    ids = ", ".join(p.id for p in profiles)
+    return MCPPingOut(ok=True, message=f"Соединение установлено, ping успешен для серверов: {ids}.")
 
 
 @app.get("/api/mcp/tools", response_model=MCPToolsOut)
 async def mcp_tools() -> MCPToolsOut:
-    """Подключается к MCP-серверу и возвращает список инструментов."""
-    from mcp_client import list_tools_dicts, session_from_settings
+    """Подключается ко всем зарегистрированным MCP-серверам и возвращает объединённый список инструментов."""
+    from mcp_client import list_tools_dicts, session_from_profile
 
-    s = load_mcp_settings()
-    if not s.enabled:
+    profiles = load_mcp_server_profiles()
+    if not profiles:
         raise HTTPException(
             status_code=503,
-            detail="MCP выключен. Задайте MCP_ENABLED=1 и параметры транспорта.",
+            detail="MCP выключен или список серверов пуст.",
         )
     timeout_sec = _mcp_connect_timeout_sec()
+    multi = len(profiles) > 1
+    tools: list[dict[str, Any]] = []
     try:
-        if timeout_sec > 0:
-            async with asyncio.timeout(timeout_sec):
-                async with session_from_settings(s) as session:
-                    tools = await list_tools_dicts(session)
-        else:
-            async with session_from_settings(s) as session:
-                tools = await list_tools_dicts(session)
+        for p in profiles:
+            if timeout_sec > 0:
+                async with asyncio.timeout(timeout_sec):
+                    async with session_from_profile(p) as session:
+                        batch = await list_tools_dicts(session)
+            else:
+                async with session_from_profile(p) as session:
+                    batch = await list_tools_dicts(session)
+            for t in batch:
+                td = dict(t)
+                td["mcp_server"] = p.id
+                if multi:
+                    orig = str(td.get("name", "") or "")
+                    td["original_name"] = orig
+                    td["name"] = f"{p.id}__{orig}"
+                tools.append(td)
     except TimeoutError:
         raise HTTPException(
             status_code=504,
@@ -621,102 +638,80 @@ async def mcp_tools() -> MCPToolsOut:
 @app.post("/api/mcp/edu-pipeline", response_model=MCPPipelineOut)
 async def mcp_edu_pipeline(body: MCPPipelineBody) -> MCPPipelineOut:
     """Учебный прогон MCP-пайплайна: search -> summarize -> saveToFile."""
-    from mcp_client import call_tool_text, session_from_settings
+    from mcp_client import call_tool_text, session_from_profile
 
-    s = load_mcp_settings()
-    if not s.enabled:
+    profiles = load_mcp_server_profiles()
+    if not profiles:
         raise HTTPException(
             status_code=503,
-            detail="MCP выключен. Задайте MCP_ENABLED=1 и параметры транспорта.",
+            detail="MCP выключен или список серверов пуст.",
+        )
+    pref = os.environ.get("MCP_EDU_PIPELINE_SERVER_ID", "edu").strip()
+    prof = next((p for p in profiles if p.id == pref), None)
+    if prof is None:
+        ids = ", ".join(p.id for p in profiles)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Нет MCP-профиля с id={pref!r}. Задайте MCP_EDU_PIPELINE_SERVER_ID или добавьте сервер в MCP_SERVERS_JSON. "
+                f"Сейчас доступны: {ids}"
+            ),
         )
     query = body.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query не может быть пустым")
 
     timeout_sec = _mcp_connect_timeout_sec()
+
+    async def _run_pipeline(session) -> tuple[str, str, str]:
+        search_raw, search_err = await call_tool_text(
+            session,
+            "search",
+            {"query": query, "limit": int(body.limit)},
+        )
+        if search_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool search failed: {search_raw or 'unknown error'}",
+            )
+        summarize_raw, summarize_err = await call_tool_text(
+            session,
+            "summarize",
+            {
+                "search_result": search_raw,
+                "max_chars": int(body.max_chars),
+                "max_points": int(body.max_points),
+            },
+        )
+        if summarize_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool summarize failed: {summarize_raw or 'unknown error'}",
+            )
+        save_raw, save_err = await call_tool_text(
+            session,
+            "saveToFile",
+            {
+                "content": summarize_raw,
+                "file_path": body.output_file,
+                "overwrite": bool(body.overwrite),
+            },
+        )
+        if save_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool saveToFile failed: {save_raw or 'unknown error'}",
+            )
+        return search_raw, summarize_raw, save_raw
+
     try:
         if timeout_sec > 0:
             async with asyncio.timeout(timeout_sec):
-                async with session_from_settings(s) as session:
-                    search_raw, search_err = await call_tool_text(
-                        session,
-                        "search",
-                        {"query": query, "limit": int(body.limit)},
-                    )
-                    if search_err:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"MCP tool search failed: {search_raw or 'unknown error'}",
-                        )
-                    summarize_raw, summarize_err = await call_tool_text(
-                        session,
-                        "summarize",
-                        {
-                            "search_result": search_raw,
-                            "max_chars": int(body.max_chars),
-                            "max_points": int(body.max_points),
-                        },
-                    )
-                    if summarize_err:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"MCP tool summarize failed: {summarize_raw or 'unknown error'}",
-                        )
-                    # Сохраняем сырой результат summarize, чтобы видеть полный JSON шага.
-                    save_raw, save_err = await call_tool_text(
-                        session,
-                        "saveToFile",
-                        {
-                            "content": summarize_raw,
-                            "file_path": body.output_file,
-                            "overwrite": bool(body.overwrite),
-                        },
-                    )
-                    if save_err:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"MCP tool saveToFile failed: {save_raw or 'unknown error'}",
-                        )
+                async with session_from_profile(prof) as session:
+                    search_raw, summarize_raw, save_raw = await _run_pipeline(session)
         else:
-            async with session_from_settings(s) as session:
-                search_raw, search_err = await call_tool_text(
-                    session,
-                    "search",
-                    {"query": query, "limit": int(body.limit)},
-                )
-                if search_err:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"MCP tool search failed: {search_raw or 'unknown error'}",
-                    )
-                summarize_raw, summarize_err = await call_tool_text(
-                    session,
-                    "summarize",
-                    {
-                        "search_result": search_raw,
-                        "max_chars": int(body.max_chars),
-                        "max_points": int(body.max_points),
-                    },
-                )
-                if summarize_err:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"MCP tool summarize failed: {summarize_raw or 'unknown error'}",
-                    )
-                save_raw, save_err = await call_tool_text(
-                    session,
-                    "saveToFile",
-                    {
-                        "content": summarize_raw,
-                        "file_path": body.output_file,
-                        "overwrite": bool(body.overwrite),
-                    },
-                )
-                if save_err:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"MCP tool saveToFile failed: {save_raw or 'unknown error'}",
-                    )
+            async with session_from_profile(prof) as session:
+                search_raw, summarize_raw, save_raw = await _run_pipeline(session)
     except TimeoutError:
         raise HTTPException(
             status_code=504,

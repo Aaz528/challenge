@@ -1,1 +1,5 @@
-# MCP demo servers (FastMCP).
+# MCP demo servers (FastMCP):
+# - mcp_servers.open_meteo_mcp
+# - mcp_servers.edu_pipeline_mcp
+# - mcp_servers.dadata_mcp
+# - mcp_servers.yandex_geocoder_mcp

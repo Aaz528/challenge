@@ -37,7 +37,7 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from app_settings import MCPSettings, load_mcp_settings
+from app_settings import MCPServerProfile, MCPSettings, load_mcp_settings
 
 
 @asynccontextmanager
@@ -86,31 +86,50 @@ async def session_streamable_http(
 
 
 @asynccontextmanager
+async def session_from_profile(
+    profile: MCPServerProfile,
+) -> AsyncIterator[ClientSession]:
+    """Подключение к одному MCP-серверу по профилю (несколько серверов — несколько профилей)."""
+    tr = (profile.transport or "").strip().lower()
+    if tr == "stdio":
+        if not profile.stdio_command:
+            raise ValueError(f"MCP [{profile.id}]: для stdio нужен stdio_command.")
+        async with session_stdio(profile.stdio_command, list(profile.stdio_args)) as session:
+            yield session
+    elif tr in ("streamable_http", "http", "streamable-http"):
+        if not profile.streamable_http_url:
+            raise ValueError(f"MCP [{profile.id}]: для streamable HTTP нужен streamable_http_url.")
+        hdrs = dict(profile.streamable_http_headers) if profile.streamable_http_headers else None
+        async with session_streamable_http(
+            profile.streamable_http_url,
+            http_timeout_sec=profile.http_timeout_sec,
+            headers=hdrs,
+        ) as session:
+            yield session
+    else:
+        raise ValueError(
+            f"MCP [{profile.id}]: transport должен быть stdio | streamable_http, получено {tr!r}."
+        )
+
+
+@asynccontextmanager
 async def session_from_settings(
     settings: MCPSettings | None = None,
 ) -> AsyncIterator[ClientSession]:
     s = settings if settings is not None else load_mcp_settings()
     if not s.enabled:
         raise ValueError("MCP выключен (MCP_ENABLED) или настройки не заданы.")
-    if s.transport == "stdio":
-        if not s.stdio_command:
-            raise ValueError("Для MCP_TRANSPORT=stdio нужен MCP_STDIO_COMMAND.")
-        async with session_stdio(s.stdio_command, list(s.stdio_args)) as session:
-            yield session
-    elif s.transport in ("streamable_http", "http", "streamable-http"):
-        if not s.streamable_http_url:
-            raise ValueError("Для streamable HTTP нужен MCP_STREAMABLE_HTTP_URL.")
-        hdrs = dict(s.streamable_http_headers) if s.streamable_http_headers else None
-        async with session_streamable_http(
-            s.streamable_http_url,
-            http_timeout_sec=s.http_timeout_sec,
-            headers=hdrs,
-        ) as session:
-            yield session
-    else:
-        raise ValueError(
-            "Укажите MCP_TRANSPORT: stdio | streamable_http (см. app_settings.load_mcp_settings)."
-        )
+    p = MCPServerProfile(
+        id="default",
+        transport=s.transport,
+        stdio_command=s.stdio_command,
+        stdio_args=s.stdio_args,
+        streamable_http_url=s.streamable_http_url,
+        http_timeout_sec=s.http_timeout_sec,
+        streamable_http_headers=s.streamable_http_headers,
+    )
+    async with session_from_profile(p) as session:
+        yield session
 
 
 def tool_to_dict(tool: types.Tool) -> dict[str, Any]:
@@ -155,6 +174,7 @@ __all__ = [
     "call_tool_text",
     "list_tools_dicts",
     "load_mcp_settings",
+    "session_from_profile",
     "session_from_settings",
     "session_stdio",
     "session_streamable_http",
