@@ -1,0 +1,62 @@
+[
+  {
+    "id": "q01",
+    "question": "Где в проекте выполняется маршрутизация вызовов MCP-инструментов по serverid__tool?",
+    "expectation": "Ответ должен упомянуть функцию маршрутизации в chat_service и логику разбора префикса serverid__.",
+    "expected_sources": ["chat_service.py", "mcp_client.py"]
+  },
+  {
+    "id": "q02",
+    "question": "Как устроена поддержка нескольких MCP серверов через MCP_SERVERS_JSON?",
+    "expectation": "Ответ должен описать профиль MCPServerProfile и разбор MCP_SERVERS_JSON с fallback на legacy MCP_*.",
+    "expected_sources": ["app_settings.py", "api/main.py"]
+  },
+  {
+    "id": "q03",
+    "question": "Где задается число раундов tool-calling для длинного multi-tool флоу?",
+    "expectation": "Ответ должен назвать переменную MCP_TOOL_MAX_ROUNDS и функцию, которая ее читает.",
+    "expected_sources": ["chat_service.py"]
+  },
+  {
+    "id": "q04",
+    "question": "Как в API проверяется доступность MCP серверов и выдаются инструменты?",
+    "expectation": "Ответ должен покрыть endpoints /api/mcp/ping и /api/mcp/tools, включая мульти-серверный режим.",
+    "expected_sources": ["api/main.py"]
+  },
+  {
+    "id": "q05",
+    "question": "Где реализован endpoint погоды Иркутска и какой fallback используется при сетевых сбоях?",
+    "expectation": "Ответ должен описать /api/weather/irkutsk и возврат cached/fallback ответа при ошибках.",
+    "expected_sources": ["api/main.py"]
+  },
+  {
+    "id": "q06",
+    "question": "Как работает потоковая отправка ответа (SSE) в API?",
+    "expectation": "Ответ должен упомянуть stream endpoint и события delta/status/done/stopped/error.",
+    "expected_sources": ["api/main.py", "frontend/src/api.ts"]
+  },
+  {
+    "id": "q07",
+    "question": "Как в проекте обновляется рабочая память ветки перед ответом в triple_memory?",
+    "expectation": "Ответ должен включать refresh_working_memory_auto и merge_working_memory.",
+    "expected_sources": ["chat_service.py", "llm_agent.py"]
+  },
+  {
+    "id": "q08",
+    "question": "Где формируется набор tools для triple memory стратегии?",
+    "expectation": "Ответ должен назвать _triple_memory_tools и объединение wm_* + MCP tools.",
+    "expected_sources": ["chat_service.py"]
+  },
+  {
+    "id": "q09",
+    "question": "Как в RAG индексаторе устроены стратегии chunking fixed и structured?",
+    "expectation": "Ответ должен сравнить chunk_fixed и chunk_by_structure (markdown/python).",
+    "expected_sources": ["scripts/rag_index_lib.py"]
+  },
+  {
+    "id": "q10",
+    "question": "Как в RAG пайплайне реализованы fallback эмбеддинги и извлечение текста из .doc?",
+    "expectation": "Ответ должен упомянуть hash-fallback-v1 и DOC extractor через strings/libreoffice.",
+    "expected_sources": ["scripts/rag_index_lib.py", "scripts/build_rag_index.py"]
+  }
+]

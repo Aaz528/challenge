@@ -6,6 +6,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,17 +44,28 @@ class Embedder:
         self._model = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small").strip()
         self._fallback_dim = 256
         self._fallback_used = False
+        self._force_local = os.environ.get("RAG_EMBED_LOCAL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        raw_timeout = os.environ.get("RAG_EMBED_TIMEOUT_SEC", "").strip()
+        try:
+            self._timeout_sec = max(5, int(raw_timeout)) if raw_timeout else 25
+        except ValueError:
+            self._timeout_sec = 25
 
     @property
     def model_name(self) -> str:
-        if self._fallback_used or not self._api_key:
+        if self._force_local or self._fallback_used or not self._api_key:
             return "hash-fallback-v1"
         return self._model
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        if not self._api_key:
+        if self._force_local or self._fallback_used or not self._api_key:
             self._fallback_used = True
             return [self._hash_embedding(t, self._fallback_dim) for t in texts]
         url = f"{self._base_url}/embeddings"
@@ -62,7 +75,7 @@ class Embedder:
         }
         payload = {"model": self._model, "input": texts}
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            resp = requests.post(url, headers=headers, json=payload, timeout=self._timeout_sec)
             resp.raise_for_status()
             data = resp.json()
             rows = data.get("data")
@@ -111,6 +124,9 @@ def load_document(path: Path) -> Document:
     if ext == ".pdf":
         text = _read_pdf(path)
         source = "pdf"
+    elif ext == ".doc":
+        text = _read_doc(path)
+        source = "article"
     elif ext in {".md", ".markdown", ".rst", ".txt"}:
         text = path.read_text(encoding="utf-8", errors="ignore")
         source = "article"
@@ -139,6 +155,76 @@ def _read_pdf(path: Path) -> str:
     for p in reader.pages:
         pages.append(p.extract_text() or "")
     return "\n\n".join(pages)
+
+
+def _read_doc(path: Path) -> str:
+    """
+    Converts legacy .doc to text using LibreOffice headless mode.
+    """
+    mode = os.environ.get("DOC_EXTRACTOR", "strings").strip().lower()
+    if mode in ("strings", "fast"):
+        return _read_doc_with_strings(path)
+
+    with tempfile.TemporaryDirectory(prefix="doc2txt_") as tmp:
+        outdir = Path(tmp)
+        timeout_sec = 600
+        raw_timeout = os.environ.get("DOC_CONVERT_TIMEOUT_SEC", "").strip()
+        if raw_timeout:
+            try:
+                timeout_sec = max(60, int(raw_timeout))
+            except ValueError:
+                timeout_sec = 600
+        # --convert-to txt:Text keeps plain text and works for .doc.
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "txt:Text",
+            "--outdir",
+            str(outdir),
+            str(path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_sec)
+        except FileNotFoundError as e:
+            return _read_doc_with_strings(path)
+        except subprocess.CalledProcessError as e:
+            _ = e
+            return _read_doc_with_strings(path)
+        except subprocess.TimeoutExpired as e:
+            _ = e
+            return _read_doc_with_strings(path)
+
+        txt_path = outdir / f"{path.stem}.txt"
+        if not txt_path.exists():
+            # Fallback for some locales/variants where name might be transformed.
+            cands = list(outdir.glob("*.txt"))
+            if not cands:
+                return _read_doc_with_strings(path)
+            txt_path = cands[0]
+        return txt_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_doc_with_strings(path: Path) -> str:
+    """
+    Lightweight fallback for legacy .doc extraction when office converter is unavailable/hangs.
+    """
+    try:
+        res = subprocess.run(
+            ["strings", "-n", "4", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Не удалось извлечь текст из .doc ни через LibreOffice, ни через strings."
+        ) from e
+    text = res.stdout.strip()
+    if not text:
+        raise RuntimeError("Извлечение .doc через strings вернуло пустой текст.")
+    return text
 
 
 def chunk_fixed(text: str, *, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
@@ -327,6 +413,7 @@ def iter_default_corpus(root: Path) -> Iterable[Path]:
         "sqlite_chat_storage.py",
         "frontend/src/App.tsx",
         "frontend/src/api.ts",
+        "гэсэр.doc",
     ]
     for rel in candidates:
         p = root / rel
