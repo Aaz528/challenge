@@ -161,6 +161,27 @@
   font-size: 0.92rem;
 }
 
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.rag-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+  font-size: 0.82rem;
+}
+
+.rag-table th,
+.rag-table td {
+  border: 1px solid #3a3f4b;
+  padding: 0.3rem 0.4rem;
+  text-align: left;
+}
+
 .sidebar {
   background: #252830;
   border-right: 1px solid #3a3f4b;

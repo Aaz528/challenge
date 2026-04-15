@@ -9,12 +9,14 @@ from rag_qa import answer_with_rag, answer_without_rag
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run 10 control questions: without RAG vs with RAG.")
+    p = argparse.ArgumentParser(description="Run 10 control questions and compare baseline RAG vs improved RAG.")
     p.add_argument("--db-path", default="rag_index.db")
     p.add_argument("--questions-path", default="docs/rag_control_questions.json")
-    p.add_argument("--report-path", default="docs/rag_vs_no_rag_report.md")
+    p.add_argument("--report-path", default="docs/rag_rerank_comparison.md")
     p.add_argument("--strategy", choices=["fixed", "structured", "all"], default="structured")
-    p.add_argument("--top-k", type=int, default=5)
+    p.add_argument("--top-k-before", type=int, default=20)
+    p.add_argument("--top-k-after", type=int, default=5)
+    p.add_argument("--sim-threshold", type=float, default=0.12)
     return p.parse_args()
 
 
@@ -43,17 +45,26 @@ def main() -> None:
         raise SystemExit("Control questions file is empty or invalid.")
 
     lines: list[str] = []
-    lines.append("# RAG vs No-RAG Quality Comparison")
+    lines.append("# RAG Rerank/Filter Comparison")
     lines.append("")
     lines.append(f"- Questions file: `{questions_path}`")
     lines.append(f"- DB: `{db_path}`")
     lines.append(f"- Retrieval strategy: `{args.strategy}`")
-    lines.append(f"- Top-k: `{args.top_k}`")
+    lines.append(
+        f"- Baseline profile: rewrite=none, rerank=none, top_k_before={args.top_k_before}, top_k_after={args.top_k_after}"
+    )
+    lines.append(
+        f"- Improved profile: rewrite=heuristic, rerank=hybrid, top_k_before={args.top_k_before}, top_k_after={args.top_k_after}, sim_threshold={args.sim_threshold}"
+    )
     lines.append("")
 
     score_no = 0
-    score_rag = 0
-    source_hits = 0
+    score_base = 0
+    score_improved = 0
+    source_hits_base = 0
+    source_hits_improved = 0
+    kept_base = 0
+    kept_improved = 0
 
     for i, row in enumerate(payload, start=1):
         qid = str(row.get("id", f"q{i:02d}"))
@@ -64,24 +75,49 @@ def main() -> None:
             continue
 
         no_rag = answer_without_rag(question)
-        with_rag = answer_with_rag(
+        rag_base = answer_with_rag(
             question,
             db_path=db_path,
             strategy=args.strategy,
-            top_k=args.top_k,
+            top_k=args.top_k_after,
+            top_k_before=args.top_k_before,
+            top_k_after=args.top_k_after,
+            rewrite_mode="none",
+            rerank_mode="none",
+            sim_threshold=0.0,
+            max_context_chars=6500,
+        )
+        rag_improved = answer_with_rag(
+            question,
+            db_path=db_path,
+            strategy=args.strategy,
+            top_k=args.top_k_after,
+            top_k_before=args.top_k_before,
+            top_k_after=args.top_k_after,
+            rewrite_mode="heuristic",
+            rerank_mode="hybrid",
+            sim_threshold=args.sim_threshold,
             max_context_chars=6500,
         )
 
         no_answer = str(no_rag.get("answer", ""))
-        rag_answer = str(with_rag.get("answer", ""))
-        rag_sources = [str(s.get("file", "")) for s in with_rag.get("sources", [])]
+        base_answer = str(rag_base.get("answer", ""))
+        improved_answer = str(rag_improved.get("answer", ""))
+        base_sources = [str(s.get("file", "")) for s in rag_base.get("sources", [])]
+        improved_sources = [str(s.get("file", "")) for s in rag_improved.get("sources", [])]
 
         no_ok = _contains_expectation(no_answer, expectation)
-        rag_ok = _contains_expectation(rag_answer, expectation)
-        src_ok = _source_match(rag_sources, expected_sources)
+        base_ok = _contains_expectation(base_answer, expectation)
+        improved_ok = _contains_expectation(improved_answer, expectation)
+        src_base_ok = _source_match(base_sources, expected_sources)
+        src_improved_ok = _source_match(improved_sources, expected_sources)
         score_no += 1 if no_ok else 0
-        score_rag += 1 if rag_ok else 0
-        source_hits += 1 if src_ok else 0
+        score_base += 1 if base_ok else 0
+        score_improved += 1 if improved_ok else 0
+        source_hits_base += 1 if src_base_ok else 0
+        source_hits_improved += 1 if src_improved_ok else 0
+        kept_base += int(rag_base.get("retrieved_count", 0))
+        kept_improved += int(rag_improved.get("retrieved_count", 0))
 
         lines.append(f"## {qid}: {question}")
         lines.append("")
@@ -95,18 +131,37 @@ def main() -> None:
         lines.append("")
         lines.append(no_answer)
         lines.append("")
-        lines.append("**Ответ с RAG**")
+        lines.append("**Ответ с RAG (baseline: без rewrite/filter)**")
         lines.append("")
-        lines.append(rag_answer)
+        lines.append(base_answer)
         lines.append("")
-        lines.append("**Источники (retrieval)**")
-        for s in with_rag.get("sources", []):
+        lines.append("**Источники baseline**")
+        for s in rag_base.get("sources", []):
             lines.append(
                 f"- score={float(s.get('score', 0.0)):.4f} file=`{s.get('file','')}` section=`{s.get('section','')}` chunk_id=`{s.get('chunk_id','')}`"
             )
         lines.append("")
+        lines.append("**Ответ с RAG (improved: rewrite + rerank/filter)**")
+        lines.append("")
+        lines.append(improved_answer)
+        lines.append("")
+        lines.append("**Источники improved**")
+        for s in rag_improved.get("sources", []):
+            lines.append(
+                f"- score={float(s.get('score', 0.0)):.4f} rerank={float(s.get('rerank_score', 0.0)):.4f} "
+                f"file=`{s.get('file','')}` section=`{s.get('section','')}` chunk_id=`{s.get('chunk_id','')}`"
+            )
+        lines.append("")
+        if rag_improved.get("filtered_out"):
+            lines.append("**Filtered out (improved)**")
+            for s in rag_improved.get("filtered_out", [])[:5]:
+                lines.append(
+                    f"- score={float(s.get('score', 0.0)):.4f} file=`{s.get('file','')}` section=`{s.get('section','')}` chunk_id=`{s.get('chunk_id','')}`"
+                )
+            lines.append("")
         lines.append(
-            f"**Автооценка:** expectation_match(no_rag)={no_ok}, expectation_match(with_rag)={rag_ok}, source_match(with_rag)={src_ok}"
+            f"**Автооценка:** expectation(no_rag)={no_ok}, expectation(baseline)={base_ok}, expectation(improved)={improved_ok}, "
+            f"source_match(baseline)={src_base_ok}, source_match(improved)={src_improved_ok}"
         )
         lines.append("")
         lines.append("---")
@@ -114,20 +169,32 @@ def main() -> None:
 
     total = len(payload)
     lines.insert(
-        6,
-        f"- Auto scores: no_rag={score_no}/{total}, with_rag={score_rag}/{total}, source_match={source_hits}/{total}",
+        8,
+        (
+            f"- Auto scores: no_rag={score_no}/{total}, baseline_rag={score_base}/{total}, "
+            f"improved_rag={score_improved}/{total}, source_match_baseline={source_hits_base}/{total}, "
+            f"source_match_improved={source_hits_improved}/{total}"
+        ),
     )
-    if score_rag > score_no:
-        conclusion = "RAG-режим показывает лучший результат по авто-проверке ожиданий."
-    elif score_rag < score_no:
-        conclusion = "No-RAG режим по авто-проверке оказался не хуже или лучше; проверьте retrieval/prompts."
+    lines.insert(
+        9,
+        f"- Avg kept chunks: baseline={kept_base / max(total,1):.2f}, improved={kept_improved / max(total,1):.2f}",
+    )
+    if score_improved > score_base:
+        conclusion = "Режим с rewrite + rerank/filter показывает лучший результат по авто-проверке ожиданий."
+    elif score_improved < score_base:
+        conclusion = "Baseline оказался не хуже improved; подберите threshold/top-k или ослабьте фильтр."
     else:
-        conclusion = "Оба режима дали сопоставимый авто-результат; вероятно нужен более строгий benchmark."
-    lines.insert(7, f"- Auto conclusion: {conclusion}")
+        conclusion = "Baseline и improved дали сопоставимый авто-результат; нужен более строгий benchmark."
+    lines.insert(10, f"- Auto conclusion: {conclusion}")
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"Report written: {report_path}")
-    print(f"Scores: no_rag={score_no}/{total}, with_rag={score_rag}/{total}, source_match={source_hits}/{total}")
+    print(
+        "Scores: "
+        f"no_rag={score_no}/{total}, baseline_rag={score_base}/{total}, improved_rag={score_improved}/{total}, "
+        f"source_match_baseline={source_hits_base}/{total}, source_match_improved={source_hits_improved}/{total}"
+    )
 
 
 if __name__ == "__main__":

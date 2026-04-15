@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -525,12 +527,61 @@ class MCPPipelineOut(BaseModel):
     save_raw: str
 
 
+class RAGQueryBody(BaseModel):
+    question: str
+    mode: str = "both"  # without_rag | with_rag | both
+    strategy: str = "structured"  # fixed | structured | all
+    top_k_before: int = Field(default=20, ge=1, le=100)
+    top_k_after: int = Field(default=5, ge=1, le=50)
+    sim_threshold: float = 0.12
+    rerank_mode: str = "hybrid"  # none | threshold | hybrid
+    rewrite_mode: str = "heuristic"  # none | heuristic
+    max_context_chars: int = Field(default=6000, ge=800, le=30000)
+    force_local: bool = False
+
+
+class RAGBenchmarkBody(BaseModel):
+    strategy: str = "structured"  # fixed | structured | all
+    top_k_before: int = Field(default=20, ge=1, le=100)
+    top_k_after: int = Field(default=5, ge=1, le=50)
+    sim_threshold: float = 0.12
+    force_local: bool = False
+
+
 def _parse_json_text_or_none(raw: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(raw)
     except Exception:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def _run_script_json(script_name: str, args: list[str], *, force_local: bool = False) -> dict[str, Any]:
+    script_path = _project_root / "scripts" / script_name
+    if not script_path.exists():
+        raise RuntimeError(f"Script not found: {script_path}")
+    env = os.environ.copy()
+    if force_local:
+        env["RAG_QA_FORCE_LOCAL"] = "1"
+    cmd = [sys.executable, str(script_path), *args, "--json"]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(_project_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "").strip() or f"Script failed: {script_name}")
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Script returned invalid JSON: {script_name}") from e
+    if not isinstance(out, dict):
+        raise RuntimeError(f"Script returned non-object JSON: {script_name}")
+    return out
 
 
 @app.get("/api/mcp/config", response_model=MCPConfigOut)
@@ -737,6 +788,100 @@ async def mcp_edu_pipeline(body: MCPPipelineBody) -> MCPPipelineOut:
         summarize_raw=summarize_raw,
         save_raw=save_raw,
     )
+
+
+@app.post("/api/rag/query")
+def rag_query(body: RAGQueryBody) -> dict[str, Any]:
+    q = body.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="question не может быть пустым")
+    mode = body.mode.strip().lower()
+    if mode not in ("without_rag", "with_rag", "both"):
+        raise HTTPException(status_code=400, detail="mode должен быть: without_rag | with_rag | both")
+    strategy = body.strategy.strip().lower()
+    if strategy not in ("fixed", "structured", "all"):
+        raise HTTPException(status_code=400, detail="strategy должен быть: fixed | structured | all")
+    rerank_mode = body.rerank_mode.strip().lower()
+    if rerank_mode not in ("none", "threshold", "hybrid"):
+        raise HTTPException(status_code=400, detail="rerank_mode должен быть: none | threshold | hybrid")
+    rewrite_mode = body.rewrite_mode.strip().lower()
+    if rewrite_mode not in ("none", "heuristic"):
+        raise HTTPException(status_code=400, detail="rewrite_mode должен быть: none | heuristic")
+    args = [
+        "--question",
+        q,
+        "--mode",
+        mode,
+        "--strategy",
+        strategy,
+        "--top-k-before",
+        str(body.top_k_before),
+        "--top-k-after",
+        str(body.top_k_after),
+        "--sim-threshold",
+        str(body.sim_threshold),
+        "--rerank-mode",
+        rerank_mode,
+        "--rewrite-mode",
+        rewrite_mode,
+        "--max-context-chars",
+        str(body.max_context_chars),
+    ]
+    try:
+        return _run_script_json("rag_qa.py", args, force_local=body.force_local)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"RAG query failed: {_mcp_error_detail(e)}") from e
+
+
+@app.post("/api/rag/benchmark")
+def rag_benchmark(body: RAGBenchmarkBody) -> dict[str, Any]:
+    strategy = body.strategy.strip().lower()
+    if strategy not in ("fixed", "structured", "all"):
+        raise HTTPException(status_code=400, detail="strategy должен быть: fixed | structured | all")
+    script_path = _project_root / "scripts" / "eval_rag_qa.py"
+    env = os.environ.copy()
+    if body.force_local:
+        env["RAG_QA_FORCE_LOCAL"] = "1"
+    report_rel = "docs/rag_rerank_comparison.md"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--strategy",
+        strategy,
+        "--top-k-before",
+        str(body.top_k_before),
+        "--top-k-after",
+        str(body.top_k_after),
+        "--sim-threshold",
+        str(body.sim_threshold),
+        "--report-path",
+        report_rel,
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(_project_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        raise HTTPException(status_code=502, detail=f"RAG benchmark failed: {msg}")
+    report_path = _project_root / report_rel
+    preview = ""
+    if report_path.exists():
+        try:
+            preview = report_path.read_text(encoding="utf-8", errors="ignore")[:4000]
+        except Exception:
+            preview = ""
+    return {
+        "ok": True,
+        "stdout": (proc.stdout or "").strip(),
+        "report_path": str(report_path),
+        "report_preview": preview,
+    }
 
 
 @app.get("/api/memory-profiles", response_model=list[MemoryProfileOut])

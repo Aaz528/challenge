@@ -24,6 +24,8 @@ import {
   putWorkingMemoryItem,
   resumeTaskFsm,
   resumeMessageStream,
+  runRagBenchmark,
+  runRagQuery,
   runMcpEduPipeline,
   sendMessageStream,
   stopAndPauseMessageStream,
@@ -33,6 +35,8 @@ import {
   type Invariant,
   type MemoryItem,
   type MemoryProfile,
+  type RagBenchmarkResponse,
+  type RagQueryResponse,
   type MCPPipelineResult,
   type TaskFSM,
   type WeatherPopup,
@@ -175,6 +179,23 @@ export default function App() {
   const [pipelineLoading, setPipelineLoading] = useState(false);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
   const [pipelineData, setPipelineData] = useState<MCPPipelineResult | null>(null);
+  const [ragLabOpen, setRagLabOpen] = useState(false);
+  const [ragQuestion, setRagQuestion] = useState("Где в проекте маршрутизация MCP-инструментов?");
+  const [ragMode, setRagMode] = useState<"without_rag" | "with_rag" | "both">("both");
+  const [ragStrategy, setRagStrategy] = useState<"fixed" | "structured" | "all">("structured");
+  const [ragRewriteMode, setRagRewriteMode] = useState<"none" | "heuristic">("heuristic");
+  const [ragRerankMode, setRagRerankMode] = useState<"none" | "threshold" | "hybrid">("hybrid");
+  const [ragTopKBefore, setRagTopKBefore] = useState("20");
+  const [ragTopKAfter, setRagTopKAfter] = useState("5");
+  const [ragThreshold, setRagThreshold] = useState("0.12");
+  const [ragMaxContext, setRagMaxContext] = useState("6000");
+  const [ragForceLocal, setRagForceLocal] = useState(true);
+  const [ragLoading, setRagLoading] = useState(false);
+  const [ragError, setRagError] = useState<string | null>(null);
+  const [ragResult, setRagResult] = useState<RagQueryResponse | null>(null);
+  const [ragBenchLoading, setRagBenchLoading] = useState(false);
+  const [ragBenchError, setRagBenchError] = useState<string | null>(null);
+  const [ragBenchResult, setRagBenchResult] = useState<RagBenchmarkResponse | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
@@ -420,6 +441,62 @@ export default function App() {
       setPipelineLoading(false);
     }
   }, [pipelineFile, pipelineQuery]);
+
+  const runRagLab = useCallback(async () => {
+    setRagLoading(true);
+    setRagError(null);
+    setRagResult(null);
+    try {
+      const out = await runRagQuery({
+        question: ragQuestion,
+        mode: ragMode,
+        strategy: ragStrategy,
+        rewrite_mode: ragRewriteMode,
+        rerank_mode: ragRerankMode,
+        top_k_before: Math.max(1, parseInt(ragTopKBefore || "20", 10) || 20),
+        top_k_after: Math.max(1, parseInt(ragTopKAfter || "5", 10) || 5),
+        sim_threshold: Number.parseFloat(ragThreshold || "0.12") || 0.12,
+        max_context_chars: Math.max(800, parseInt(ragMaxContext || "6000", 10) || 6000),
+        force_local: ragForceLocal,
+      });
+      setRagResult(out);
+    } catch (e: unknown) {
+      setRagError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRagLoading(false);
+    }
+  }, [
+    ragForceLocal,
+    ragMaxContext,
+    ragMode,
+    ragQuestion,
+    ragRerankMode,
+    ragRewriteMode,
+    ragStrategy,
+    ragThreshold,
+    ragTopKAfter,
+    ragTopKBefore,
+  ]);
+
+  const runRagBenchmarkUi = useCallback(async () => {
+    setRagBenchLoading(true);
+    setRagBenchError(null);
+    setRagBenchResult(null);
+    try {
+      const out = await runRagBenchmark({
+        strategy: ragStrategy,
+        top_k_before: Math.max(1, parseInt(ragTopKBefore || "20", 10) || 20),
+        top_k_after: Math.max(1, parseInt(ragTopKAfter || "5", 10) || 5),
+        sim_threshold: Number.parseFloat(ragThreshold || "0.12") || 0.12,
+        force_local: ragForceLocal,
+      });
+      setRagBenchResult(out);
+    } catch (e: unknown) {
+      setRagBenchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRagBenchLoading(false);
+    }
+  }, [ragForceLocal, ragStrategy, ragThreshold, ragTopKAfter, ragTopKBefore]);
 
   const handleNewChat = async () => {
     setError(null);
@@ -1074,6 +1151,14 @@ export default function App() {
                 disabled={loading || pipelineLoading}
               >
                 MCP pipeline demo
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setRagLabOpen(true)}
+                disabled={loading || ragLoading || ragBenchLoading}
+              >
+                RAG Lab
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -2085,6 +2170,208 @@ export default function App() {
                   disabled={pipelineLoading || !pipelineQuery.trim()}
                 >
                   Запустить
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {ragLabOpen && (
+          <div className="modal-backdrop" role="presentation">
+            <div className="modal modal-wide">
+              <h3>RAG Lab</h3>
+              <p className="hint">
+                Запуск одиночного RAG-запроса и benchmark (10 вопросов): baseline vs improved.
+              </p>
+              <div className="pipeline-grid">
+                <div className="pipeline-step">
+                  <h4>Параметры запроса</h4>
+                  <label>
+                    Вопрос
+                    <textarea
+                      rows={3}
+                      value={ragQuestion}
+                      onChange={(e) => setRagQuestion(e.target.value)}
+                    />
+                  </label>
+                  <div className="settings-row">
+                    <label>
+                      Mode
+                      <select
+                        value={ragMode}
+                        onChange={(e) => setRagMode(e.target.value as "without_rag" | "with_rag" | "both")}
+                      >
+                        <option value="both">both</option>
+                        <option value="without_rag">without_rag</option>
+                        <option value="with_rag">with_rag</option>
+                      </select>
+                    </label>
+                    <label>
+                      Strategy
+                      <select
+                        value={ragStrategy}
+                        onChange={(e) => setRagStrategy(e.target.value as "fixed" | "structured" | "all")}
+                      >
+                        <option value="structured">structured</option>
+                        <option value="fixed">fixed</option>
+                        <option value="all">all</option>
+                      </select>
+                    </label>
+                    <label>
+                      Rewrite
+                      <select
+                        value={ragRewriteMode}
+                        onChange={(e) => setRagRewriteMode(e.target.value as "none" | "heuristic")}
+                      >
+                        <option value="heuristic">heuristic</option>
+                        <option value="none">none</option>
+                      </select>
+                    </label>
+                    <label>
+                      Rerank
+                      <select
+                        value={ragRerankMode}
+                        onChange={(e) => setRagRerankMode(e.target.value as "none" | "threshold" | "hybrid")}
+                      >
+                        <option value="hybrid">hybrid</option>
+                        <option value="threshold">threshold</option>
+                        <option value="none">none</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="settings-row">
+                    <label>
+                      Top-K before
+                      <input value={ragTopKBefore} onChange={(e) => setRagTopKBefore(e.target.value)} />
+                    </label>
+                    <label>
+                      Top-K after
+                      <input value={ragTopKAfter} onChange={(e) => setRagTopKAfter(e.target.value)} />
+                    </label>
+                    <label>
+                      Similarity threshold
+                      <input value={ragThreshold} onChange={(e) => setRagThreshold(e.target.value)} />
+                    </label>
+                    <label>
+                      Max context chars
+                      <input value={ragMaxContext} onChange={(e) => setRagMaxContext(e.target.value)} />
+                    </label>
+                  </div>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={ragForceLocal}
+                      onChange={(e) => setRagForceLocal(e.target.checked)}
+                    />
+                    Force local fallback (без внешнего LLM)
+                  </label>
+                  <div className="modal-actions">
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => void runRagLab()}
+                      disabled={ragLoading || !ragQuestion.trim()}
+                    >
+                      {ragLoading ? "Выполняю..." : "Запустить Query"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => void runRagBenchmarkUi()}
+                      disabled={ragBenchLoading}
+                    >
+                      {ragBenchLoading ? "Benchmark..." : "Запустить Benchmark"}
+                    </button>
+                  </div>
+                </div>
+                <div className="pipeline-step">
+                  <h4>Результаты Query</h4>
+                  {ragError && <div className="memory-err">{ragError}</div>}
+                  {!ragError && !ragResult && <p className="hint">Пока нет результата.</p>}
+                  {ragResult && (
+                    <>
+                      {ragResult.without_rag && (
+                        <>
+                          <h4>without_rag</h4>
+                          <pre className="text">{ragResult.without_rag.answer}</pre>
+                        </>
+                      )}
+                      {ragResult.with_rag && (
+                        <>
+                          <h4>with_rag</h4>
+                          <pre className="text">{ragResult.with_rag.answer}</pre>
+                          <p className="hint">
+                            {`rewritten: ${ragResult.with_rag.query_rewritten ?? ""} | before: ${
+                              ragResult.with_rag.retrieved_before_count ?? 0
+                            } -> after: ${ragResult.with_rag.retrieved_count ?? 0}`}
+                          </p>
+                          <table className="rag-table">
+                            <thead>
+                              <tr>
+                                <th>score</th>
+                                <th>rerank</th>
+                                <th>file</th>
+                                <th>section</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(ragResult.with_rag.sources ?? []).slice(0, 8).map((s) => (
+                                <tr key={s.chunk_id}>
+                                  <td>{s.score.toFixed(4)}</td>
+                                  <td>{(s.rerank_score ?? 0).toFixed(4)}</td>
+                                  <td>{s.file}</td>
+                                  <td>{s.section}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          <h4>Filtered Out</h4>
+                          {(ragResult.with_rag.filtered_out ?? []).length === 0 ? (
+                            <p className="hint">Нет отфильтрованных чанков для текущих параметров.</p>
+                          ) : (
+                            <table className="rag-table">
+                              <thead>
+                                <tr>
+                                  <th>score</th>
+                                  <th>file</th>
+                                  <th>section</th>
+                                  <th>chunk_id</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(ragResult.with_rag.filtered_out ?? []).slice(0, 12).map((s) => (
+                                  <tr key={s.chunk_id}>
+                                    <td>{s.score.toFixed(4)}</td>
+                                    <td>{s.file}</td>
+                                    <td>{s.section}</td>
+                                    <td>{s.chunk_id}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+                <div className="pipeline-step">
+                  <h4>Benchmark</h4>
+                  {ragBenchError && <div className="memory-err">{ragBenchError}</div>}
+                  {!ragBenchError && !ragBenchResult && <p className="hint">Запустите benchmark для отчёта.</p>}
+                  {ragBenchResult && (
+                    <>
+                      <p className="hint">{ragBenchResult.stdout}</p>
+                      <p>
+                        <strong>Report:</strong> {ragBenchResult.report_path}
+                      </p>
+                      <pre className="text">{ragBenchResult.report_preview}</pre>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn" onClick={() => setRagLabOpen(false)}>
+                  Закрыть
                 </button>
               </div>
             </div>

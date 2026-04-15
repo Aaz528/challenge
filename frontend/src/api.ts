@@ -51,6 +51,51 @@ export type MCPPipelineResult = {
   save_raw: string;
 };
 
+export type RagSource = {
+  chunk_id: string;
+  score: number;
+  rerank_score?: number;
+  keyword_overlap?: number;
+  file: string;
+  section: string;
+  strategy: string;
+};
+
+export type RagModeResult = {
+  mode: string;
+  answer: string;
+  sources?: RagSource[];
+  filtered_out?: Array<{
+    chunk_id: string;
+    score: number;
+    file: string;
+    section: string;
+  }>;
+  retrieved_count?: number;
+  retrieved_before_count?: number;
+  query_original?: string;
+  query_rewritten?: string;
+  rewrite_mode?: string;
+  rerank_mode?: string;
+  sim_threshold?: number;
+  top_k_before?: number;
+  top_k_after?: number;
+  fallback?: boolean;
+};
+
+export type RagQueryResponse = {
+  question: string;
+  without_rag?: RagModeResult;
+  with_rag?: RagModeResult;
+};
+
+export type RagBenchmarkResponse = {
+  ok: boolean;
+  stdout: string;
+  report_path: string;
+  report_preview: string;
+};
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
@@ -77,6 +122,43 @@ export async function runMcpEduPipeline(body: {
 }): Promise<MCPPipelineResult> {
   return json(
     await fetch("/api/mcp/edu-pipeline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function runRagQuery(body: {
+  question: string;
+  mode?: "without_rag" | "with_rag" | "both";
+  strategy?: "fixed" | "structured" | "all";
+  top_k_before?: number;
+  top_k_after?: number;
+  sim_threshold?: number;
+  rerank_mode?: "none" | "threshold" | "hybrid";
+  rewrite_mode?: "none" | "heuristic";
+  max_context_chars?: number;
+  force_local?: boolean;
+}): Promise<RagQueryResponse> {
+  return json(
+    await fetch("/api/rag/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function runRagBenchmark(body: {
+  strategy?: "fixed" | "structured" | "all";
+  top_k_before?: number;
+  top_k_after?: number;
+  sim_threshold?: number;
+  force_local?: boolean;
+}): Promise<RagBenchmarkResponse> {
+  return json(
+    await fetch("/api/rag/benchmark", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
