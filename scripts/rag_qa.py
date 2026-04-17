@@ -28,7 +28,7 @@ class RetrievedChunk:
     keyword_overlap: int = 0
 
 
-def _call_llm(messages: list[dict[str, str]]) -> str:
+def _call_llm(messages: list[dict[str, str]], *, json_object: bool = False) -> str:
     load_dotenv()
     if os.environ.get("RAG_QA_FORCE_LOCAL", "").strip().lower() in ("1", "true", "yes", "on"):
         raise RuntimeError("local mode requested")
@@ -44,23 +44,217 @@ def _call_llm(messages: list[dict[str, str]]) -> str:
             timeout_sec = max(10, int(raw_to))
         except ValueError:
             timeout_sec = 45
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 1400,
+    }
+    if json_object:
+        body["response_format"] = {"type": "json_object"}
     resp = requests.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 900,
-        },
+        json=body,
         timeout=timeout_sec,
     )
+    if json_object and resp.status_code >= 400:
+        body.pop("response_format", None)
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=timeout_sec,
+        )
     resp.raise_for_status()
     data = resp.json()
     text = str(data["choices"][0]["message"]["content"]).strip()
     if not text:
         raise RuntimeError("LLM returned empty text")
     return text
+
+
+def _strip_json_fence(raw: str) -> str:
+    t = raw.strip()
+    if t.startswith("```"):
+        lines = t.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
+
+def _parse_json_object(raw: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(_strip_json_fence(raw))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
+
+
+def _quote_is_substring(quote: str, chunk_text: str) -> bool:
+    q = _norm_ws(quote)
+    if len(q) < 4:
+        return False
+    c = _norm_ws(chunk_text)
+    return q in c
+
+
+def _chunk_by_id(chunks: list[RetrievedChunk]) -> dict[str, RetrievedChunk]:
+    return {c.chunk_id: c for c in chunks}
+
+
+def _repair_or_drop_quote(
+    chunk_id: str, quote: str, by_id: dict[str, RetrievedChunk], *, max_len: int = 320
+) -> dict[str, str] | None:
+    ch = by_id.get(chunk_id)
+    if ch is None:
+        return None
+    qt = quote.strip()
+    if qt and _quote_is_substring(qt, ch.text):
+        return {"chunk_id": chunk_id, "text": qt[:max_len]}
+    snippet = _norm_ws(ch.text.replace("\n", " "))[:max_len]
+    if len(snippet) < 12:
+        return None
+    return {"chunk_id": chunk_id, "text": snippet}
+
+
+def _ensure_quotes(
+    parsed: dict[str, Any],
+    chunks_after: list[RetrievedChunk],
+) -> list[dict[str, str]]:
+    by_id = _chunk_by_id(chunks_after)
+    raw_list = parsed.get("quotes")
+    if not isinstance(raw_list, list):
+        raw_list = []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("chunk_id", "")).strip()
+        text = str(item.get("text", item.get("quote", ""))).strip()
+        if not cid:
+            continue
+        fixed = _repair_or_drop_quote(cid, text, by_id)
+        if fixed is None:
+            continue
+        key = f"{fixed['chunk_id']}::{fixed['text'][:40]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fixed)
+    if not out and chunks_after:
+        for ch in chunks_after[:5]:
+            snippet = _norm_ws(ch.text.replace("\n", " "))[:300]
+            out.append({"chunk_id": ch.chunk_id, "text": snippet})
+    return out
+
+
+def _merge_llm_answer(parsed: dict[str, Any]) -> str:
+    ans = parsed.get("answer")
+    if isinstance(ans, str) and ans.strip():
+        return ans.strip()
+    return ""
+
+
+def _resolved_answer_min_score(sim_threshold: float, answer_min_score: float | None) -> float:
+    if answer_min_score is not None:
+        return float(answer_min_score)
+    raw = os.environ.get("RAG_ANSWER_MIN_SCORE", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return float(sim_threshold)
+
+
+def _structured_fallback_answer(question: str, chunks: list[RetrievedChunk]) -> tuple[str, list[dict[str, str]]]:
+    if not chunks:
+        return (
+            "Локальный fallback: релевантные чанки не переданы. "
+            f"Вопрос: {question}",
+            [],
+        )
+    lines = [
+        "Локальный fallback-ответ (LLM недоступен): кратко по найденным фрагментам.",
+        "",
+    ]
+    quotes: list[dict[str, str]] = []
+    for ch in chunks[:5]:
+        snippet = _norm_ws(ch.text.replace("\n", " "))[:280]
+        quotes.append({"chunk_id": ch.chunk_id, "text": snippet})
+        lines.append(
+            f"- [{ch.meta.get('file', '')}] {ch.section} (chunk_id={ch.chunk_id}, score={ch.score:.4f}): {snippet}"
+        )
+    return "\n".join(lines), quotes
+
+
+def _dont_know_payload(
+    *,
+    question: str,
+    chunks_before: list[RetrievedChunk],
+    chunks_after: list[RetrievedChunk],
+    removed: list[RetrievedChunk],
+    max_score: float | None,
+    threshold: float,
+    reason: str,
+    query_original: str,
+    query_rewritten: str,
+    rewrite_mode: str,
+    rerank_mode: str,
+    sim_threshold: float,
+    k_before: int,
+    k_after: int,
+    filtered_out: list[dict[str, Any]],
+    answer_override: str | None = None,
+    keyword_overlap_max: int | None = None,
+    keyword_overlap_required: int | None = None,
+    answer_min_score: float | None = None,
+) -> dict[str, Any]:
+    _ = question
+    if answer_override is not None:
+        msg = answer_override
+    else:
+        msg = (
+            "Не могу надёжно ответить по текущему индексу: релевантность лучших фрагментов ниже порога "
+            f"({max_score if max_score is not None else 'n/a'} < {threshold:g}). "
+            "Уточните вопрос, укажите файл или область проекта."
+        )
+    out: dict[str, Any] = {
+        "mode": "with_rag",
+        "answer": msg,
+        "sources": [],
+        "quotes": [],
+        "dont_know": True,
+        "dont_know_reason": reason,
+        "relevance_max_score": max_score,
+        "relevance_threshold": threshold,
+        "retrieved_before_count": len(chunks_before),
+        "retrieved_count": len(chunks_after),
+        "query_original": query_original,
+        "query_rewritten": query_rewritten,
+        "rewrite_mode": rewrite_mode,
+        "rerank_mode": rerank_mode,
+        "sim_threshold": sim_threshold,
+        "top_k_before": k_before,
+        "top_k_after": k_after,
+        "filtered_out": filtered_out,
+    }
+    if answer_min_score is not None:
+        out["answer_min_score"] = answer_min_score
+    if keyword_overlap_max is not None:
+        out["keyword_overlap_max"] = keyword_overlap_max
+    if keyword_overlap_required is not None:
+        out["keyword_overlap_required"] = keyword_overlap_required
+    return out
 
 
 def _rewrite_query(question: str, mode: str) -> str:
@@ -140,6 +334,28 @@ def _keyword_overlap(query: str, text: str) -> int:
     return sum(1 for w in q_words if w in t)
 
 
+def _max_keyword_overlap_across_chunks(query: str, chunks: list[RetrievedChunk]) -> int:
+    """Сколько значимых слов запроса (≥4 символа) попало хотя бы в один чанк (section+text).
+
+    Возвращает -1, если в запросе нет ни одного такого слова — тогда порог по пересечению не применяем.
+    """
+    q_words = {w for w in re.findall(r"[a-zA-Zа-яА-Я0-9_]{4,}", query.lower())}
+    if not q_words:
+        return -1
+    best = 0
+    for ch in chunks:
+        best = max(best, _keyword_overlap(query, f"{ch.section}\n{ch.text}"))
+    return best
+
+
+def _resolved_min_keyword_overlap() -> int:
+    raw = os.environ.get("RAG_MIN_QUERY_TERM_OVERLAP", "1").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
 def _rerank_and_filter(
     query_for_retrieval: str,
     chunks_before: list[RetrievedChunk],
@@ -199,26 +415,6 @@ def _rerank_and_filter(
     return result, removed
 
 
-def _fallback_answer(question: str, chunks: list[RetrievedChunk]) -> str:
-    if not chunks:
-        return (
-            "Локальный fallback-ответ: не удалось вызвать LLM и не найдены релевантные чанки в индексе. "
-            f"Вопрос: {question}"
-        )
-    lines = [
-        "Локальный fallback-ответ (LLM недоступен):",
-        f"Вопрос: {question}",
-        "",
-        "Релевантные фрагменты:",
-    ]
-    for i, ch in enumerate(chunks[:5], start=1):
-        snippet = ch.text.replace("\n", " ")[:220]
-        lines.append(
-            f"{i}) [{ch.meta.get('file', '')}] {ch.section} (score={ch.score:.4f}, rerank={ch.rerank_score:.4f}): {snippet}"
-        )
-    return "\n".join(lines)
-
-
 def answer_without_rag(question: str) -> dict[str, Any]:
     messages = [
         {"role": "system", "content": "You are a concise technical assistant. Answer in Russian."},
@@ -248,11 +444,14 @@ def answer_with_rag(
     top_k_before: int | None = None,
     top_k_after: int | None = None,
     sim_threshold: float = 0.12,
+    answer_min_score: float | None = None,
 ) -> dict[str, Any]:
     query_original = question.strip()
     query_rewritten = _rewrite_query(query_original, rewrite_mode)
     k_before = max(1, int(top_k_before if top_k_before is not None else max(top_k, 12)))
     k_after = max(1, int(top_k_after if top_k_after is not None else top_k))
+    min_for_answer = _resolved_answer_min_score(sim_threshold, answer_min_score)
+
     chunks_before = _retrieve(db_path, query_rewritten, strategy=strategy, top_k=k_before)
     chunks_after, removed = _rerank_and_filter(
         query_rewritten,
@@ -261,6 +460,105 @@ def answer_with_rag(
         sim_threshold=sim_threshold,
         top_k_after=k_after,
     )
+    filtered_out = [
+        {
+            "chunk_id": c.chunk_id,
+            "score": c.score,
+            "file": c.meta.get("file", ""),
+            "section": c.section,
+        }
+        for c in removed[:20]
+    ]
+
+    if not chunks_before:
+        return _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=None,
+            threshold=min_for_answer,
+            reason="no_chunks_in_index",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+
+    if not chunks_after:
+        return _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=None,
+            threshold=min_for_answer,
+            reason="no_chunks_after_rerank",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+
+    max_score = max(c.score for c in chunks_after)
+    if max_score < min_for_answer:
+        return _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=max_score,
+            threshold=min_for_answer,
+            reason="below_relevance_threshold",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+
+    min_kw = _resolved_min_keyword_overlap()
+    kw_max = _max_keyword_overlap_across_chunks(query_original, chunks_after)
+    if min_kw > 0 and kw_max >= 0 and kw_max < min_kw:
+        return _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=max_score,
+            threshold=min_for_answer,
+            reason="no_query_term_overlap",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_override=(
+                "По индексу этого репозитория не видно пересечения значимых слов вопроса с найденными фрагментами кода. "
+                "Индекс описывает проект, а не произвольные темы; сформулируйте вопрос в терминах кода, API, файлов или компонентов."
+            ),
+            keyword_overlap_max=kw_max,
+            keyword_overlap_required=min_kw,
+            answer_min_score=min_for_answer,
+        )
+
     sources = [
         {
             "chunk_id": c.chunk_id,
@@ -272,15 +570,6 @@ def answer_with_rag(
             "strategy": c.strategy,
         }
         for c in chunks_after
-    ]
-    filtered_out = [
-        {
-            "chunk_id": c.chunk_id,
-            "score": c.score,
-            "file": c.meta.get("file", ""),
-            "section": c.section,
-        }
-        for c in removed[:20]
     ]
     ctx_parts: list[str] = []
     used = 0
@@ -294,13 +583,19 @@ def answer_with_rag(
         ctx_parts.append(block)
         used += len(block)
     context = "\n\n".join(ctx_parts).strip()
+    schema_hint = (
+        '{"answer":"краткий ответ на русском",'
+        '"quotes":[{"chunk_id":"<id из контекста>","text":"дословная цитата из того же чанка, до ~400 символов"}]}'
+    )
     messages = [
         {
             "role": "system",
             "content": (
-                "Ты технический ассистент. Отвечай по-русски. "
-                "Используй контекст из источников ниже. Если в контексте не хватает данных, скажи об этом явно. "
-                "Не выдумывай факты."
+                "Ты технический ассистент. Отвечай по-русски только на основе контекста. "
+                "Верни ТОЛЬКО один JSON-объект без markdown и без пояснений. Схема: "
+                f"{schema_hint} "
+                "Поля quotes обязательны: одна или несколько дословных подстрок из соответствующих чанков; "
+                "chunk_id должен совпадать с chunk_id из контекста. Не выдумывай факты и не подставляй текст не из контекста."
             ),
         },
         {
@@ -308,14 +603,18 @@ def answer_with_rag(
             "content": (
                 f"Вопрос:\n{query_original}\n\n"
                 f"Контекст:\n{context}\n\n"
-                "Сформируй ответ и коротко укажи, на какие источники ты опирался."
+                "Сформируй JSON с полями answer и quotes; цитаты — только из текста контекста выше."
             ),
         },
     ]
-    payload = {
+    payload: dict[str, Any] = {
         "mode": "with_rag",
         "answer": "",
         "sources": sources,
+        "quotes": [],
+        "dont_know": False,
+        "relevance_max_score": max_score,
+        "relevance_threshold": min_for_answer,
         "retrieved_before_count": len(chunks_before),
         "retrieved_count": len(chunks_after),
         "query_original": query_original,
@@ -323,17 +622,25 @@ def answer_with_rag(
         "rewrite_mode": rewrite_mode,
         "rerank_mode": rerank_mode,
         "sim_threshold": sim_threshold,
+        "answer_min_score": min_for_answer,
         "top_k_before": k_before,
         "top_k_after": k_after,
         "filtered_out": filtered_out,
     }
     try:
-        payload["answer"] = _call_llm(messages)
-        return payload
+        raw = _call_llm(messages, json_object=True)
+        parsed = _parse_json_object(raw) or {}
+        ans = _merge_llm_answer(parsed)
+        if not ans:
+            ans = "По приведённым фрагментам данных недостаточно для полного ответа."
+        payload["answer"] = ans
+        payload["quotes"] = _ensure_quotes(parsed, chunks_after)
     except Exception:
-        payload["answer"] = _fallback_answer(query_original, chunks_after)
+        ans, quotes = _structured_fallback_answer(query_original, chunks_after)
+        payload["answer"] = ans
+        payload["quotes"] = quotes
         payload["fallback"] = True
-        return payload
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -346,6 +653,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-k-before", type=int, default=20)
     p.add_argument("--top-k-after", type=int, default=5)
     p.add_argument("--sim-threshold", type=float, default=0.12)
+    p.add_argument(
+        "--answer-min-score",
+        type=float,
+        default=None,
+        help="Мин. embedding score лучшего чанка; ниже — ответ «не знаю» (по умолчанию: RAG_ANSWER_MIN_SCORE или sim-threshold).",
+    )
     p.add_argument("--rerank-mode", choices=["none", "threshold", "hybrid"], default="hybrid")
     p.add_argument("--rewrite-mode", choices=["none", "heuristic"], default="heuristic")
     p.add_argument("--max-context-chars", type=int, default=6000)
@@ -372,6 +685,7 @@ def main() -> None:
             top_k_before=max(1, args.top_k_before),
             top_k_after=max(1, args.top_k_after),
             sim_threshold=float(args.sim_threshold),
+            answer_min_score=args.answer_min_score,
             rewrite_mode=args.rewrite_mode,
             rerank_mode=args.rerank_mode,
             max_context_chars=max(800, args.max_context_chars),
@@ -395,6 +709,12 @@ def main() -> None:
             print(f"Query rewritten: {rag.get('query_rewritten')}")
             print(rag["answer"])
             print()
+            if rag.get("dont_know"):
+                print(
+                    f"(dont_know: {rag.get('dont_know_reason')} | "
+                    f"max_score={rag.get('relevance_max_score')} < threshold={rag.get('relevance_threshold')})"
+                )
+                print()
             srcs = rag.get("sources", [])
             if srcs:
                 print("Sources:")
@@ -403,6 +723,14 @@ def main() -> None:
                         f"- score={s['score']:.4f} rerank={s['rerank_score']:.4f} "
                         f"file={s['file']} section={s['section']} chunk_id={s['chunk_id']}"
                     )
+            qs = rag.get("quotes") or []
+            if qs:
+                print()
+                print("Quotes:")
+                for q in qs:
+                    tid = q.get("chunk_id", "")
+                    tx = str(q.get("text", "")).replace("\n", " ")[:200]
+                    print(f"- chunk_id={tid}: {tx}…")
 
 
 if __name__ == "__main__":

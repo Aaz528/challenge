@@ -188,6 +188,7 @@ export default function App() {
   const [ragTopKBefore, setRagTopKBefore] = useState("20");
   const [ragTopKAfter, setRagTopKAfter] = useState("5");
   const [ragThreshold, setRagThreshold] = useState("0.12");
+  const [ragAnswerMinScore, setRagAnswerMinScore] = useState("");
   const [ragMaxContext, setRagMaxContext] = useState("6000");
   const [ragForceLocal, setRagForceLocal] = useState(true);
   const [ragLoading, setRagLoading] = useState(false);
@@ -447,6 +448,9 @@ export default function App() {
     setRagError(null);
     setRagResult(null);
     try {
+      const amRaw = ragAnswerMinScore.trim();
+      const answer_min_score =
+        amRaw === "" ? undefined : Number.parseFloat(amRaw);
       const out = await runRagQuery({
         question: ragQuestion,
         mode: ragMode,
@@ -456,6 +460,8 @@ export default function App() {
         top_k_before: Math.max(1, parseInt(ragTopKBefore || "20", 10) || 20),
         top_k_after: Math.max(1, parseInt(ragTopKAfter || "5", 10) || 5),
         sim_threshold: Number.parseFloat(ragThreshold || "0.12") || 0.12,
+        answer_min_score:
+          answer_min_score !== undefined && !Number.isNaN(answer_min_score) ? answer_min_score : undefined,
         max_context_chars: Math.max(800, parseInt(ragMaxContext || "6000", 10) || 6000),
         force_local: ragForceLocal,
       });
@@ -466,6 +472,7 @@ export default function App() {
       setRagLoading(false);
     }
   }, [
+    ragAnswerMinScore,
     ragForceLocal,
     ragMaxContext,
     ragMode,
@@ -2252,6 +2259,14 @@ export default function App() {
                       <input value={ragThreshold} onChange={(e) => setRagThreshold(e.target.value)} />
                     </label>
                     <label>
+                      Answer min score (опц.)
+                      <input
+                        value={ragAnswerMinScore}
+                        onChange={(e) => setRagAnswerMinScore(e.target.value)}
+                        placeholder="как sim_threshold"
+                      />
+                    </label>
+                    <label>
                       Max context chars
                       <input value={ragMaxContext} onChange={(e) => setRagMaxContext(e.target.value)} />
                     </label>
@@ -2298,56 +2313,100 @@ export default function App() {
                       {ragResult.with_rag && (
                         <>
                           <h4>with_rag</h4>
+                          {ragResult.with_rag.dont_know && (
+                            <p className="memory-err">
+                              {ragResult.with_rag.dont_know_reason === "no_query_term_overlap"
+                                ? `Вне домена индекса: вопрос не пересекается с содержимым репозитория (max overlap ${ragResult.with_rag.keyword_overlap_max ?? "—"}, требуется ≥${ragResult.with_rag.keyword_overlap_required ?? "—"}).`
+                                : `Режим «не знаю» (${ragResult.with_rag.dont_know_reason ?? "?"}) — max_score ${ragResult.with_rag.relevance_max_score ?? "—"}, порог ${ragResult.with_rag.relevance_threshold ?? "—"}.`}
+                            </p>
+                          )}
                           <pre className="text">{ragResult.with_rag.answer}</pre>
                           <p className="hint">
                             {`rewritten: ${ragResult.with_rag.query_rewritten ?? ""} | before: ${
                               ragResult.with_rag.retrieved_before_count ?? 0
                             } -> after: ${ragResult.with_rag.retrieved_count ?? 0}`}
+                            {` | quotes: ${(ragResult.with_rag.quotes ?? []).length}`}
                           </p>
-                          <table className="rag-table">
-                            <thead>
-                              <tr>
-                                <th>score</th>
-                                <th>rerank</th>
-                                <th>file</th>
-                                <th>section</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {(ragResult.with_rag.sources ?? []).slice(0, 8).map((s) => (
-                                <tr key={s.chunk_id}>
-                                  <td>{s.score.toFixed(4)}</td>
-                                  <td>{(s.rerank_score ?? 0).toFixed(4)}</td>
-                                  <td>{s.file}</td>
-                                  <td>{s.section}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                          <h4>Filtered Out</h4>
-                          {(ragResult.with_rag.filtered_out ?? []).length === 0 ? (
-                            <p className="hint">Нет отфильтрованных чанков для текущих параметров.</p>
-                          ) : (
-                            <table className="rag-table">
-                              <thead>
-                                <tr>
-                                  <th>score</th>
-                                  <th>file</th>
-                                  <th>section</th>
-                                  <th>chunk_id</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {(ragResult.with_rag.filtered_out ?? []).slice(0, 12).map((s) => (
-                                  <tr key={s.chunk_id}>
-                                    <td>{s.score.toFixed(4)}</td>
-                                    <td>{s.file}</td>
-                                    <td>{s.section}</td>
-                                    <td>{s.chunk_id}</td>
+                          {!ragResult.with_rag.dont_know && (
+                            <>
+                              <table className="rag-table">
+                                <thead>
+                                  <tr>
+                                    <th>score</th>
+                                    <th>rerank</th>
+                                    <th>file</th>
+                                    <th>section</th>
+                                    <th>chunk_id</th>
                                   </tr>
-                                ))}
-                              </tbody>
-                            </table>
+                                </thead>
+                                <tbody>
+                                  {(ragResult.with_rag.sources ?? []).slice(0, 8).map((s) => (
+                                    <tr key={s.chunk_id}>
+                                      <td>{s.score.toFixed(4)}</td>
+                                      <td>{(s.rerank_score ?? 0).toFixed(4)}</td>
+                                      <td>{s.file}</td>
+                                      <td>{s.section}</td>
+                                      <td>{s.chunk_id}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {(ragResult.with_rag.quotes ?? []).length > 0 && (
+                                <>
+                                  <h4>Цитаты</h4>
+                                  <table className="rag-table">
+                                    <thead>
+                                      <tr>
+                                        <th>chunk_id</th>
+                                        <th>текст</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {(ragResult.with_rag.quotes ?? []).slice(0, 12).map((q) => (
+                                        <tr key={`${q.chunk_id}-${q.text.slice(0, 12)}`}>
+                                          <td>{q.chunk_id}</td>
+                                          <td className="text">{q.text}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </>
+                              )}
+                            </>
+                          )}
+                          {ragResult.with_rag.dont_know && (
+                            <p className="hint">
+                              Источники и цитаты скрыты: модель перешла в безопасный режим «не знаю».
+                            </p>
+                          )}
+                          {!ragResult.with_rag.dont_know && (
+                            <>
+                              <h4>Filtered Out</h4>
+                              {(ragResult.with_rag.filtered_out ?? []).length === 0 ? (
+                                <p className="hint">Нет отфильтрованных чанков для текущих параметров.</p>
+                              ) : (
+                                <table className="rag-table">
+                                  <thead>
+                                    <tr>
+                                      <th>score</th>
+                                      <th>file</th>
+                                      <th>section</th>
+                                      <th>chunk_id</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {(ragResult.with_rag.filtered_out ?? []).slice(0, 12).map((s) => (
+                                      <tr key={s.chunk_id}>
+                                        <td>{s.score.toFixed(4)}</td>
+                                        <td>{s.file}</td>
+                                        <td>{s.section}</td>
+                                        <td>{s.chunk_id}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              )}
+                            </>
                           )}
                         </>
                       )}

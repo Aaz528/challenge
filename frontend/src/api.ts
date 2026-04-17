@@ -61,10 +61,22 @@ export type RagSource = {
   strategy: string;
 };
 
+export type RagQuote = {
+  chunk_id: string;
+  text: string;
+};
+
 export type RagModeResult = {
   mode: string;
   answer: string;
   sources?: RagSource[];
+  quotes?: RagQuote[];
+  dont_know?: boolean;
+  dont_know_reason?: string;
+  relevance_max_score?: number | null;
+  relevance_threshold?: number;
+  keyword_overlap_max?: number;
+  keyword_overlap_required?: number;
   filtered_out?: Array<{
     chunk_id: string;
     score: number;
@@ -78,6 +90,7 @@ export type RagModeResult = {
   rewrite_mode?: string;
   rerank_mode?: string;
   sim_threshold?: number;
+  answer_min_score?: number;
   top_k_before?: number;
   top_k_after?: number;
   fallback?: boolean;
@@ -136,6 +149,7 @@ export async function runRagQuery(body: {
   top_k_before?: number;
   top_k_after?: number;
   sim_threshold?: number;
+  answer_min_score?: number | null;
   rerank_mode?: "none" | "threshold" | "hybrid";
   rewrite_mode?: "none" | "heuristic";
   max_context_chars?: number;

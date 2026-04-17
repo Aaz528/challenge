@@ -534,6 +534,10 @@ class RAGQueryBody(BaseModel):
     top_k_before: int = Field(default=20, ge=1, le=100)
     top_k_after: int = Field(default=5, ge=1, le=50)
     sim_threshold: float = 0.12
+    answer_min_score: float | None = Field(
+        default=None,
+        description="Мин. score лучшего чанка; ниже — «не знаю». None = RAG_ANSWER_MIN_SCORE или sim_threshold.",
+    )
     rerank_mode: str = "hybrid"  # none | threshold | hybrid
     rewrite_mode: str = "heuristic"  # none | heuristic
     max_context_chars: int = Field(default=6000, ge=800, le=30000)
@@ -827,6 +831,8 @@ def rag_query(body: RAGQueryBody) -> dict[str, Any]:
         "--max-context-chars",
         str(body.max_context_chars),
     ]
+    if body.answer_min_score is not None:
+        args.extend(["--answer-min-score", str(body.answer_min_score)])
     try:
         return _run_script_json("rag_qa.py", args, force_local=body.force_local)
     except Exception as e:
