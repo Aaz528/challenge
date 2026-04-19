@@ -102,6 +102,25 @@ export type RagQueryResponse = {
   with_rag?: RagModeResult;
 };
 
+export type RagMiniChatTaskMemory = {
+  goal?: string;
+  clarified?: string[];
+  constraints?: string[];
+  terms?: Record<string, string>;
+};
+
+export type RagMiniChatTurnResponse = {
+  answer: string;
+  sources: RagSource[];
+  quotes?: RagQuote[];
+  task_memory: RagMiniChatTaskMemory;
+  dont_know?: boolean;
+  dont_know_reason?: string;
+  retrieval_query?: string;
+  query_rewritten?: string;
+  fallback?: boolean;
+};
+
 export type RagBenchmarkResponse = {
   ok: boolean;
   stdout: string;
@@ -173,6 +192,25 @@ export async function runRagBenchmark(body: {
 }): Promise<RagBenchmarkResponse> {
   return json(
     await fetch("/api/rag/benchmark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function runRagMiniChatTurn(body: {
+  message: string;
+  history?: Array<{ role: string; content: string }>;
+  task_memory?: RagMiniChatTaskMemory;
+  strategy?: "fixed" | "structured" | "all";
+  top_k_before?: number;
+  top_k_after?: number;
+  sim_threshold?: number;
+  max_context_chars?: number;
+}): Promise<RagMiniChatTurnResponse> {
+  return json(
+    await fetch("/api/rag/mini_chat/turn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

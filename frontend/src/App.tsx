@@ -25,6 +25,7 @@ import {
   resumeTaskFsm,
   resumeMessageStream,
   runRagBenchmark,
+  runRagMiniChatTurn,
   runRagQuery,
   runMcpEduPipeline,
   sendMessageStream,
@@ -36,6 +37,8 @@ import {
   type MemoryItem,
   type MemoryProfile,
   type RagBenchmarkResponse,
+  type RagMiniChatTaskMemory,
+  type RagMiniChatTurnResponse,
   type RagQueryResponse,
   type MCPPipelineResult,
   type TaskFSM,
@@ -197,6 +200,13 @@ export default function App() {
   const [ragBenchLoading, setRagBenchLoading] = useState(false);
   const [ragBenchError, setRagBenchError] = useState<string | null>(null);
   const [ragBenchResult, setRagBenchResult] = useState<RagBenchmarkResponse | null>(null);
+  const [miniRagOpen, setMiniRagOpen] = useState(false);
+  const [miniRagInput, setMiniRagInput] = useState("");
+  const [miniRagHistory, setMiniRagHistory] = useState<Array<{ role: string; content: string }>>([]);
+  const [miniRagTaskMemory, setMiniRagTaskMemory] = useState<RagMiniChatTaskMemory>({});
+  const [miniRagLast, setMiniRagLast] = useState<RagMiniChatTurnResponse | null>(null);
+  const [miniRagLoading, setMiniRagLoading] = useState(false);
+  const [miniRagError, setMiniRagError] = useState<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
@@ -504,6 +514,43 @@ export default function App() {
       setRagBenchLoading(false);
     }
   }, [ragForceLocal, ragStrategy, ragThreshold, ragTopKAfter, ragTopKBefore]);
+
+  const sendMiniRag = useCallback(async () => {
+    const text = miniRagInput.trim();
+    if (!text || miniRagLoading) return;
+    setMiniRagLoading(true);
+    setMiniRagError(null);
+    try {
+      const out = await runRagMiniChatTurn({
+        message: text,
+        history: miniRagHistory,
+        task_memory: miniRagTaskMemory,
+        strategy: ragStrategy,
+        top_k_before: Math.max(1, parseInt(ragTopKBefore || "20", 10) || 20),
+        top_k_after: Math.max(1, parseInt(ragTopKAfter || "5", 10) || 5),
+        sim_threshold: Number.parseFloat(ragThreshold || "0.12") || 0.12,
+        max_context_chars: Math.max(800, parseInt(ragMaxContext || "5000", 10) || 5000),
+      });
+      setMiniRagHistory((h) => [...h, { role: "user", content: text }, { role: "assistant", content: out.answer }]);
+      setMiniRagTaskMemory(out.task_memory ?? {});
+      setMiniRagLast(out);
+      setMiniRagInput("");
+    } catch (e: unknown) {
+      setMiniRagError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMiniRagLoading(false);
+    }
+  }, [
+    miniRagHistory,
+    miniRagInput,
+    miniRagLoading,
+    miniRagTaskMemory,
+    ragMaxContext,
+    ragStrategy,
+    ragThreshold,
+    ragTopKAfter,
+    ragTopKBefore,
+  ]);
 
   const handleNewChat = async () => {
     setError(null);
@@ -1166,6 +1213,14 @@ export default function App() {
                 disabled={loading || ragLoading || ragBenchLoading}
               >
                 RAG Lab
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setMiniRagOpen(true)}
+                disabled={loading || miniRagLoading}
+              >
+                RAG чат
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -2430,6 +2485,107 @@ export default function App() {
               </div>
               <div className="modal-actions">
                 <button type="button" className="btn" onClick={() => setRagLabOpen(false)}>
+                  Закрыть
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {miniRagOpen && (
+          <div className="modal-backdrop" role="presentation">
+            <div className="modal modal-wide">
+              <h3>RAG мини-чат</h3>
+              <p className="hint">
+                Диалог с retrieval по индексу и «памятью задачи» (цель, уточнения, ограничения). История хранится
+                только в браузере до сброса.
+              </p>
+              {miniRagError && <div className="memory-err">{miniRagError}</div>}
+              <div className="pipeline-grid">
+                <div className="pipeline-step">
+                  <h4>Диалог</h4>
+                  <pre className="text mini-rag-transcript">
+                    {miniRagHistory.length === 0
+                      ? "(пусто)"
+                      : miniRagHistory
+                          .map((m) => `${m.role === "user" ? "Вы" : "Ассистент"}: ${m.content}`)
+                          .join("\n\n")}
+                  </pre>
+                  <label>
+                    Сообщение
+                    <textarea
+                      rows={3}
+                      value={miniRagInput}
+                      onChange={(e) => setMiniRagInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                          e.preventDefault();
+                          void sendMiniRag();
+                        }
+                      }}
+                    />
+                  </label>
+                  <p className="hint">Ctrl+Enter — отправить.</p>
+                  <div className="modal-actions" style={{ justifyContent: "flex-start", marginTop: "0.5rem" }}>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => void sendMiniRag()}
+                      disabled={miniRagLoading || !miniRagInput.trim()}
+                    >
+                      {miniRagLoading ? "…" : "Отправить"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        setMiniRagHistory([]);
+                        setMiniRagTaskMemory({});
+                        setMiniRagLast(null);
+                        setMiniRagError(null);
+                      }}
+                    >
+                      Сбросить сессию
+                    </button>
+                  </div>
+                </div>
+                <div className="pipeline-step">
+                  <h4>Память задачи</h4>
+                  <pre className="text mini-rag-transcript">
+                    {JSON.stringify(miniRagTaskMemory, null, 2) || "{}"}
+                  </pre>
+                  <h4>Источники (последний ход)</h4>
+                  {!miniRagLast || miniRagLast.dont_know ? (
+                    <p className="hint">
+                      {miniRagLast?.dont_know
+                        ? `Нет надёжного контекста (${miniRagLast.dont_know_reason ?? ""}).`
+                        : "Ещё не было ответа."}
+                    </p>
+                  ) : (
+                    <table className="rag-table">
+                      <thead>
+                        <tr>
+                          <th>score</th>
+                          <th>file</th>
+                          <th>section</th>
+                          <th>chunk_id</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(miniRagLast.sources ?? []).slice(0, 10).map((s) => (
+                          <tr key={s.chunk_id}>
+                            <td>{s.score.toFixed(4)}</td>
+                            <td>{s.file}</td>
+                            <td>{s.section}</td>
+                            <td>{s.chunk_id}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn" onClick={() => setMiniRagOpen(false)}>
                   Закрыть
                 </button>
               </div>

@@ -552,6 +552,19 @@ class RAGBenchmarkBody(BaseModel):
     force_local: bool = False
 
 
+class RagMiniChatTurnBody(BaseModel):
+    """Один ход мини-чата RAG + память задачи (история и task_memory приходит с клиента)."""
+
+    message: str
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    task_memory: dict[str, Any] = Field(default_factory=dict)
+    strategy: str = "structured"
+    top_k_before: int = Field(default=20, ge=1, le=100)
+    top_k_after: int = Field(default=5, ge=1, le=50)
+    sim_threshold: float = 0.12
+    max_context_chars: int = Field(default=5000, ge=800, le=30000)
+
+
 def _parse_json_text_or_none(raw: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(raw)
@@ -888,6 +901,44 @@ def rag_benchmark(body: RAGBenchmarkBody) -> dict[str, Any]:
         "report_path": str(report_path),
         "report_preview": preview,
     }
+
+
+@app.post("/api/rag/mini_chat/turn")
+def rag_mini_chat_turn_ep(body: RagMiniChatTurnBody) -> dict[str, Any]:
+    q = body.message.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="message не может быть пустым")
+    strategy = body.strategy.strip().lower()
+    if strategy not in ("fixed", "structured", "all"):
+        raise HTTPException(status_code=400, detail="strategy должен быть: fixed | structured | all")
+    hist: list[dict[str, str]] = []
+    for m in body.history:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "")).strip()
+        content = str(m.get("content", "")).strip()
+        if role in ("user", "assistant") and content:
+            hist.append({"role": role, "content": content})
+    scripts = str(_project_root / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from rag_mini_chat import run_mini_chat_turn
+
+    db_path = _project_root / "rag_index.db"
+    try:
+        return run_mini_chat_turn(
+            q,
+            history=hist,
+            task_memory=body.task_memory,
+            db_path=db_path,
+            strategy=strategy,
+            top_k_before=body.top_k_before,
+            top_k_after=body.top_k_after,
+            sim_threshold=body.sim_threshold,
+            max_context_chars=body.max_context_chars,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"RAG mini-chat: {_mcp_error_detail(e)}") from e
 
 
 @app.get("/api/memory-profiles", response_model=list[MemoryProfileOut])

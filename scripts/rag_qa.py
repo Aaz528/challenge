@@ -415,6 +415,187 @@ def _rerank_and_filter(
     return result, removed
 
 
+def prepare_rag_context(
+    question: str,
+    *,
+    db_path: Path,
+    strategy: str = "structured",
+    top_k: int = 5,
+    max_context_chars: int = 6000,
+    rewrite_mode: str = "none",
+    rerank_mode: str = "none",
+    top_k_before: int | None = None,
+    top_k_after: int | None = None,
+    sim_threshold: float = 0.12,
+    answer_min_score: float | None = None,
+) -> dict[str, Any]:
+    """Подготовка retrieval: либо dont_know (как в answer_with_rag), либо ok + chunks + context."""
+    query_original = question.strip()
+    query_rewritten = _rewrite_query(query_original, rewrite_mode)
+    k_before = max(1, int(top_k_before if top_k_before is not None else max(top_k, 12)))
+    k_after = max(1, int(top_k_after if top_k_after is not None else top_k))
+    min_for_answer = _resolved_answer_min_score(sim_threshold, answer_min_score)
+
+    chunks_before = _retrieve(db_path, query_rewritten, strategy=strategy, top_k=k_before)
+    chunks_after, removed = _rerank_and_filter(
+        query_rewritten,
+        chunks_before,
+        rerank_mode=rerank_mode,
+        sim_threshold=sim_threshold,
+        top_k_after=k_after,
+    )
+    filtered_out = [
+        {
+            "chunk_id": c.chunk_id,
+            "score": c.score,
+            "file": c.meta.get("file", ""),
+            "section": c.section,
+        }
+        for c in removed[:20]
+    ]
+
+    if not chunks_before:
+        payload = _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=None,
+            threshold=min_for_answer,
+            reason="no_chunks_in_index",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+        payload["status"] = "dont_know"
+        return payload
+
+    if not chunks_after:
+        payload = _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=None,
+            threshold=min_for_answer,
+            reason="no_chunks_after_rerank",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+        payload["status"] = "dont_know"
+        return payload
+
+    max_score = max(c.score for c in chunks_after)
+    if max_score < min_for_answer:
+        payload = _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=max_score,
+            threshold=min_for_answer,
+            reason="below_relevance_threshold",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_min_score=min_for_answer,
+        )
+        payload["status"] = "dont_know"
+        return payload
+
+    min_kw = _resolved_min_keyword_overlap()
+    kw_max = _max_keyword_overlap_across_chunks(query_original, chunks_after)
+    if min_kw > 0 and kw_max >= 0 and kw_max < min_kw:
+        payload = _dont_know_payload(
+            question=query_original,
+            chunks_before=chunks_before,
+            chunks_after=chunks_after,
+            removed=removed,
+            max_score=max_score,
+            threshold=min_for_answer,
+            reason="no_query_term_overlap",
+            query_original=query_original,
+            query_rewritten=query_rewritten,
+            rewrite_mode=rewrite_mode,
+            rerank_mode=rerank_mode,
+            sim_threshold=sim_threshold,
+            k_before=k_before,
+            k_after=k_after,
+            filtered_out=filtered_out,
+            answer_override=(
+                "По индексу этого репозитория не видно пересечения значимых слов вопроса с найденными фрагментами кода. "
+                "Индекс описывает проект, а не произвольные темы; сформулируйте вопрос в терминах кода, API, файлов или компонентов."
+            ),
+            keyword_overlap_max=kw_max,
+            keyword_overlap_required=min_kw,
+            answer_min_score=min_for_answer,
+        )
+        payload["status"] = "dont_know"
+        return payload
+
+    sources = [
+        {
+            "chunk_id": c.chunk_id,
+            "score": c.score,
+            "rerank_score": c.rerank_score,
+            "keyword_overlap": c.keyword_overlap,
+            "file": c.meta.get("file", ""),
+            "section": c.section,
+            "strategy": c.strategy,
+        }
+        for c in chunks_after
+    ]
+    ctx_parts: list[str] = []
+    used = 0
+    for ch in chunks_after:
+        block = (
+            f"[SOURCE file={ch.meta.get('file','')} section={ch.section} chunk_id={ch.chunk_id} "
+            f"score={ch.score:.4f} rerank={ch.rerank_score:.4f}]\n{ch.text}\n"
+        )
+        if used + len(block) > max_context_chars:
+            break
+        ctx_parts.append(block)
+        used += len(block)
+    context = "\n\n".join(ctx_parts).strip()
+    return {
+        "status": "ok",
+        "query_original": query_original,
+        "query_rewritten": query_rewritten,
+        "chunks_after": chunks_after,
+        "sources": sources,
+        "context": context,
+        "filtered_out": filtered_out,
+        "retrieved_before_count": len(chunks_before),
+        "retrieved_count": len(chunks_after),
+        "rewrite_mode": rewrite_mode,
+        "rerank_mode": rerank_mode,
+        "sim_threshold": sim_threshold,
+        "answer_min_score": min_for_answer,
+        "top_k_before": k_before,
+        "top_k_after": k_after,
+        "relevance_max_score": max_score,
+        "relevance_threshold": min_for_answer,
+    }
+
+
 def answer_without_rag(question: str) -> dict[str, Any]:
     messages = [
         {"role": "system", "content": "You are a concise technical assistant. Answer in Russian."},
@@ -446,143 +627,34 @@ def answer_with_rag(
     sim_threshold: float = 0.12,
     answer_min_score: float | None = None,
 ) -> dict[str, Any]:
-    query_original = question.strip()
-    query_rewritten = _rewrite_query(query_original, rewrite_mode)
-    k_before = max(1, int(top_k_before if top_k_before is not None else max(top_k, 12)))
-    k_after = max(1, int(top_k_after if top_k_after is not None else top_k))
-    min_for_answer = _resolved_answer_min_score(sim_threshold, answer_min_score)
-
-    chunks_before = _retrieve(db_path, query_rewritten, strategy=strategy, top_k=k_before)
-    chunks_after, removed = _rerank_and_filter(
-        query_rewritten,
-        chunks_before,
+    prep = prepare_rag_context(
+        question,
+        db_path=db_path,
+        strategy=strategy,
+        top_k=top_k,
+        max_context_chars=max_context_chars,
+        rewrite_mode=rewrite_mode,
         rerank_mode=rerank_mode,
+        top_k_before=top_k_before,
+        top_k_after=top_k_after,
         sim_threshold=sim_threshold,
-        top_k_after=k_after,
+        answer_min_score=answer_min_score,
     )
-    filtered_out = [
-        {
-            "chunk_id": c.chunk_id,
-            "score": c.score,
-            "file": c.meta.get("file", ""),
-            "section": c.section,
-        }
-        for c in removed[:20]
-    ]
+    if prep.get("status") == "dont_know":
+        out = {k: v for k, v in prep.items() if k != "status"}
+        return out
 
-    if not chunks_before:
-        return _dont_know_payload(
-            question=query_original,
-            chunks_before=chunks_before,
-            chunks_after=chunks_after,
-            removed=removed,
-            max_score=None,
-            threshold=min_for_answer,
-            reason="no_chunks_in_index",
-            query_original=query_original,
-            query_rewritten=query_rewritten,
-            rewrite_mode=rewrite_mode,
-            rerank_mode=rerank_mode,
-            sim_threshold=sim_threshold,
-            k_before=k_before,
-            k_after=k_after,
-            filtered_out=filtered_out,
-            answer_min_score=min_for_answer,
-        )
+    query_original = str(prep["query_original"])
+    query_rewritten = str(prep["query_rewritten"])
+    chunks_after: list[RetrievedChunk] = prep["chunks_after"]  # type: ignore[assignment]
+    sources = prep["sources"]
+    context = str(prep["context"])
+    filtered_out = prep["filtered_out"]
+    k_before = int(prep["top_k_before"])
+    k_after = int(prep["top_k_after"])
+    min_for_answer = float(prep["answer_min_score"])
+    max_score = float(prep["relevance_max_score"])
 
-    if not chunks_after:
-        return _dont_know_payload(
-            question=query_original,
-            chunks_before=chunks_before,
-            chunks_after=chunks_after,
-            removed=removed,
-            max_score=None,
-            threshold=min_for_answer,
-            reason="no_chunks_after_rerank",
-            query_original=query_original,
-            query_rewritten=query_rewritten,
-            rewrite_mode=rewrite_mode,
-            rerank_mode=rerank_mode,
-            sim_threshold=sim_threshold,
-            k_before=k_before,
-            k_after=k_after,
-            filtered_out=filtered_out,
-            answer_min_score=min_for_answer,
-        )
-
-    max_score = max(c.score for c in chunks_after)
-    if max_score < min_for_answer:
-        return _dont_know_payload(
-            question=query_original,
-            chunks_before=chunks_before,
-            chunks_after=chunks_after,
-            removed=removed,
-            max_score=max_score,
-            threshold=min_for_answer,
-            reason="below_relevance_threshold",
-            query_original=query_original,
-            query_rewritten=query_rewritten,
-            rewrite_mode=rewrite_mode,
-            rerank_mode=rerank_mode,
-            sim_threshold=sim_threshold,
-            k_before=k_before,
-            k_after=k_after,
-            filtered_out=filtered_out,
-            answer_min_score=min_for_answer,
-        )
-
-    min_kw = _resolved_min_keyword_overlap()
-    kw_max = _max_keyword_overlap_across_chunks(query_original, chunks_after)
-    if min_kw > 0 and kw_max >= 0 and kw_max < min_kw:
-        return _dont_know_payload(
-            question=query_original,
-            chunks_before=chunks_before,
-            chunks_after=chunks_after,
-            removed=removed,
-            max_score=max_score,
-            threshold=min_for_answer,
-            reason="no_query_term_overlap",
-            query_original=query_original,
-            query_rewritten=query_rewritten,
-            rewrite_mode=rewrite_mode,
-            rerank_mode=rerank_mode,
-            sim_threshold=sim_threshold,
-            k_before=k_before,
-            k_after=k_after,
-            filtered_out=filtered_out,
-            answer_override=(
-                "По индексу этого репозитория не видно пересечения значимых слов вопроса с найденными фрагментами кода. "
-                "Индекс описывает проект, а не произвольные темы; сформулируйте вопрос в терминах кода, API, файлов или компонентов."
-            ),
-            keyword_overlap_max=kw_max,
-            keyword_overlap_required=min_kw,
-            answer_min_score=min_for_answer,
-        )
-
-    sources = [
-        {
-            "chunk_id": c.chunk_id,
-            "score": c.score,
-            "rerank_score": c.rerank_score,
-            "keyword_overlap": c.keyword_overlap,
-            "file": c.meta.get("file", ""),
-            "section": c.section,
-            "strategy": c.strategy,
-        }
-        for c in chunks_after
-    ]
-    ctx_parts: list[str] = []
-    used = 0
-    for ch in chunks_after:
-        block = (
-            f"[SOURCE file={ch.meta.get('file','')} section={ch.section} chunk_id={ch.chunk_id} "
-            f"score={ch.score:.4f} rerank={ch.rerank_score:.4f}]\n{ch.text}\n"
-        )
-        if used + len(block) > max_context_chars:
-            break
-        ctx_parts.append(block)
-        used += len(block)
-    context = "\n\n".join(ctx_parts).strip()
     schema_hint = (
         '{"answer":"краткий ответ на русском",'
         '"quotes":[{"chunk_id":"<id из контекста>","text":"дословная цитата из того же чанка, до ~400 символов"}]}'
@@ -615,7 +687,7 @@ def answer_with_rag(
         "dont_know": False,
         "relevance_max_score": max_score,
         "relevance_threshold": min_for_answer,
-        "retrieved_before_count": len(chunks_before),
+        "retrieved_before_count": int(prep["retrieved_before_count"]),
         "retrieved_count": len(chunks_after),
         "query_original": query_original,
         "query_rewritten": query_rewritten,

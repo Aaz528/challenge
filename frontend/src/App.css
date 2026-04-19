@@ -177,6 +177,19 @@
   box-sizing: border-box;
 }
 
+.mini-rag-transcript {
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 0 0.5rem;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  background: #252830;
+  border: 1px solid #3a3f4b;
+  border-radius: 8px;
+}
+
 .checkbox-row {
   display: flex;
   align-items: center;
