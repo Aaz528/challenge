@@ -1,0 +1,87 @@
+name: PR Review (RAG)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-rag-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build RAG index (code + docs)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
+        run: |
+          python scripts/build_rag_index.py --reset --strategy both
+
+      - name: Generate assistant review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+        run: |
+          mkdir -p artifacts
+          python scripts/review_pr.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --output artifacts/pr_review.md \
+            --json-output artifacts/pr_review.json
+
+      - name: Upload review artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-rag
+          path: artifacts/
+
+      - name: Build managed PR comment body
+        run: |
+          cat > artifacts/pr_review_comment.md <<'EOF'
+          ## PR Review (RAG)
+
+          _Этот комментарий обновляется автоматически на каждом запуске workflow._
+
+          EOF
+          cat artifacts/pr_review.md >> artifacts/pr_review_comment.md
+          cat >> artifacts/pr_review_comment.md <<'EOF'
+
+          ---
+          Reviewed commit: `${{ github.event.pull_request.head.sha }}`
+          Workflow run: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          <!-- rag-pr-review:managed -->
+          EOF
+
+      - name: Upsert review comment in PR (anti-spam)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file artifacts/pr_review_comment.md \
+            --edit-last \
+            --create-if-none
