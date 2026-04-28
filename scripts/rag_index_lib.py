@@ -415,7 +415,34 @@ def iter_default_corpus(root: Path) -> Iterable[Path]:
         "frontend/src/api.ts",
         "гэсэр.doc",
     ]
+    seen: set[Path] = set()
+
+    def _yield_if_file(p: Path) -> Iterable[Path]:
+        rp = p.resolve()
+        if rp in seen:
+            return
+        if p.exists() and p.is_file():
+            seen.add(rp)
+            yield p
+
+    # Existing code-centric defaults.
     for rel in candidates:
         p = root / rel
-        if p.exists() and p.is_file():
-            yield p
+        yield from _yield_if_file(p)
+
+    # Project documentation (README if present).
+    for pat in ("README*", "readme*"):
+        for p in root.glob(pat):
+            yield from _yield_if_file(p)
+
+    # docs folder (articles, reports, control datasets, API/spec artifacts).
+    docs_dir = root / "docs"
+    if docs_dir.exists() and docs_dir.is_dir():
+        for ext in ("*.md", "*.markdown", "*.rst", "*.txt", "*.json", "*.yaml", "*.yml"):
+            for p in docs_dir.rglob(ext):
+                yield from _yield_if_file(p)
+
+    # Extra API/schema descriptors often stored outside docs.
+    for ext in ("*.json", "*.yaml", "*.yml"):
+        for p in (root / "api").glob(ext):
+            yield from _yield_if_file(p)

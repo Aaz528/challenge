@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from app_settings import (
     MEMORY_DEFAULTS,
@@ -30,6 +33,115 @@ class SendMessageResult:
     total_tokens_branch: int
     total_tokens_chat: int
     elapsed_sec: float
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _render_rag_help_text(rag: dict) -> str:
+    answer = str(rag.get("answer", "")).strip() or "Не удалось сформировать ответ."
+    srcs = rag.get("sources") or []
+    lines = [answer, "", "Источники:"]
+    if not srcs:
+        lines.append("- (нет источников: слабый или отсутствующий контекст)")
+    else:
+        for s in srcs[:10]:
+            lines.append(
+                f"- {s.get('file','')} | {s.get('section','')} | chunk_id={s.get('chunk_id','')}"
+            )
+    return "\n".join(lines).strip()
+
+
+def _run_rag_help(question: str) -> dict:
+    root = _project_root()
+    script = root / "scripts" / "rag_qa.py"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--question",
+        question,
+        "--mode",
+        "with_rag",
+        "--strategy",
+        "structured",
+        "--rewrite-mode",
+        "heuristic",
+        "--rerank-mode",
+        "hybrid",
+        "--top-k-before",
+        "20",
+        "--top-k-after",
+        "5",
+        "--sim-threshold",
+        "0.12",
+        "--max-context-chars",
+        "6500",
+        "--json",
+    ]
+    env = os.environ.copy()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        return {
+            "answer": f"Не удалось выполнить /help через RAG: {msg or 'unknown error'}",
+            "sources": [],
+        }
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {
+            "answer": "Не удалось разобрать JSON-ответ RAG для /help.",
+            "sources": [],
+        }
+    wr = out.get("with_rag")
+    if isinstance(wr, dict):
+        return wr
+    return {
+        "answer": "RAG не вернул секцию with_rag для /help.",
+        "sources": [],
+    }
+
+
+def _handle_help_command(
+    storage: SQLiteChatStorage,
+    chat_id: int,
+    branch_id: int,
+    user_text: str,
+) -> SendMessageResult:
+    question = user_text[len("/help") :].strip()
+    if not question:
+        assistant = (
+            "Команда `/help` отвечает по документации и контексту проекта.\n"
+            "Пример: `/help где в проекте проверяется MCP ping?`\n\n"
+            "Источники:\n- docs/*, код проекта и RAG-индекс `rag_index.db`."
+        )
+    else:
+        rag = _run_rag_help(question)
+        assistant = _render_rag_help_text(rag)
+
+    storage.append_message(chat_id, branch_id, "user", user_text)
+    storage.append_message(chat_id, branch_id, "assistant", assistant)
+    branch = storage.get_branch(branch_id)
+    chat = storage.get_chat(chat_id)
+    b_tokens = branch.total_tokens if branch else 0
+    c_tokens = chat.total_tokens if chat else 0
+    return SendMessageResult(
+        assistant_text=assistant,
+        model="rag-help",
+        tokens_this_turn=None,
+        total_tokens_branch=b_tokens,
+        total_tokens_chat=c_tokens,
+        elapsed_sec=0.0,
+    )
 
 
 TASK_FSM_KEY = "task_fsm"
@@ -644,6 +756,8 @@ def send_message(
     branch = storage.get_branch(branch_id)
     if not branch or branch.chat_id != chat_id:
         raise ValueError("Ветка не найдена")
+    if user_text.lower().startswith("/help"):
+        return _handle_help_command(storage, chat_id, branch_id, user_text)
 
     strategy = normalize_memory_strategy(branch.memory_strategy)
     params = parse_strategy_params(branch)
@@ -756,6 +870,11 @@ def send_message_stream(
     branch = storage.get_branch(branch_id)
     if not branch or branch.chat_id != chat_id:
         raise ValueError("Ветка не найдена")
+    if user_text.lower().startswith("/help"):
+        yield {"type": "status", "phase": "help", "message": "Ищу ответ в документации проекта..."}
+        result = _handle_help_command(storage, chat_id, branch_id, user_text)
+        yield {"type": "done", "result": result}
+        return
 
     strategy = normalize_memory_strategy(branch.memory_strategy)
     params = parse_strategy_params(branch)

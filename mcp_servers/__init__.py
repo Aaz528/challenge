@@ -3,3 +3,4 @@
 # - mcp_servers.edu_pipeline_mcp
 # - mcp_servers.dadata_mcp
 # - mcp_servers.yandex_geocoder_mcp
+# - mcp_servers.project_git_mcp

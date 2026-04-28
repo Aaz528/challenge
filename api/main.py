@@ -527,6 +527,25 @@ class MCPPipelineOut(BaseModel):
     save_raw: str
 
 
+class MCPProjectGitDemoBody(BaseModel):
+    """Учебный прогон git-инструментов MCP: branch + files + diff."""
+
+    file_limit: int = Field(default=20, ge=1, le=500)
+    include_untracked: bool = False
+    diff_max_chars: int = Field(default=3000, ge=200, le=50000)
+    diff_staged: bool = False
+    diff_ref: str = ""
+    diff_file_path: str = ""
+
+
+class MCPProjectGitDemoOut(BaseModel):
+    ok: bool
+    server_id: str
+    branch_raw: str
+    files_raw: str
+    diff_raw: str
+
+
 class RAGQueryBody(BaseModel):
     question: str
     mode: str = "both"  # without_rag | with_rag | both
@@ -804,6 +823,102 @@ async def mcp_edu_pipeline(body: MCPPipelineBody) -> MCPPipelineOut:
         search_raw=search_raw,
         summarize_raw=summarize_raw,
         save_raw=save_raw,
+    )
+
+
+@app.post("/api/mcp/project-git-demo", response_model=MCPProjectGitDemoOut)
+async def mcp_project_git_demo(body: MCPProjectGitDemoBody) -> MCPProjectGitDemoOut:
+    """Учебный прогон git MCP: currentBranch -> listProjectFiles -> gitDiff."""
+    from mcp_client import call_tool_text, session_from_profile
+
+    profiles = load_mcp_server_profiles()
+    if not profiles:
+        raise HTTPException(
+            status_code=503,
+            detail="MCP выключен или список серверов пуст.",
+        )
+    pref = os.environ.get("MCP_PROJECT_GIT_SERVER_ID", "projectgit").strip()
+    prof = next((p for p in profiles if p.id == pref), None)
+    if prof is None:
+        ids = ", ".join(p.id for p in profiles)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Нет MCP-профиля с id={pref!r}. Задайте MCP_PROJECT_GIT_SERVER_ID или добавьте сервер в MCP_SERVERS_JSON. "
+                f"Сейчас доступны: {ids}"
+            ),
+        )
+    timeout_sec = _mcp_connect_timeout_sec()
+
+    async def _run_demo(session) -> tuple[str, str, str]:
+        branch_raw, branch_err = await call_tool_text(session, "currentBranch", {})
+        if branch_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool currentBranch failed: {branch_raw or 'unknown error'}",
+            )
+        files_raw, files_err = await call_tool_text(
+            session,
+            "listProjectFiles",
+            {
+                "limit": int(body.file_limit),
+                "include_untracked": bool(body.include_untracked),
+            },
+        )
+        if files_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool listProjectFiles failed: {files_raw or 'unknown error'}",
+            )
+        diff_raw, diff_err = await call_tool_text(
+            session,
+            "gitDiff",
+            {
+                "ref": body.diff_ref,
+                "staged": bool(body.diff_staged),
+                "file_path": body.diff_file_path,
+                "max_chars": int(body.diff_max_chars),
+            },
+        )
+        if diff_err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MCP tool gitDiff failed: {diff_raw or 'unknown error'}",
+            )
+        return branch_raw, files_raw, diff_raw
+
+    try:
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_profile(prof) as session:
+                    branch_raw, files_raw, diff_raw = await _run_demo(session)
+        else:
+            async with session_from_profile(prof) as session:
+                branch_raw, files_raw, diff_raw = await _run_demo(session)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"MCP: таймаут {timeout_sec:g}s при выполнении project-git demo.",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
+
+    # Контракт: инструменты возвращают JSON-строки.
+    if _parse_json_text_or_none(branch_raw) is None:
+        raise HTTPException(status_code=502, detail="currentBranch вернул не-JSON текст")
+    if _parse_json_text_or_none(files_raw) is None:
+        raise HTTPException(status_code=502, detail="listProjectFiles вернул не-JSON текст")
+    if _parse_json_text_or_none(diff_raw) is None:
+        raise HTTPException(status_code=502, detail="gitDiff вернул не-JSON текст")
+
+    return MCPProjectGitDemoOut(
+        ok=True,
+        server_id=prof.id,
+        branch_raw=branch_raw,
+        files_raw=files_raw,
+        diff_raw=diff_raw,
     )
 
 
