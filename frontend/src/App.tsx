@@ -27,6 +27,7 @@ import {
   runRagBenchmark,
   runRagMiniChatTurn,
   runRagQuery,
+  runSupportAsk,
   runMcpEduPipeline,
   sendMessageStream,
   stopAndPauseMessageStream,
@@ -40,6 +41,7 @@ import {
   type RagMiniChatTaskMemory,
   type RagMiniChatTurnResponse,
   type RagQueryResponse,
+  type SupportAskResponse,
   type MCPPipelineResult,
   type TaskFSM,
   type WeatherPopup,
@@ -207,6 +209,13 @@ export default function App() {
   const [miniRagLast, setMiniRagLast] = useState<RagMiniChatTurnResponse | null>(null);
   const [miniRagLoading, setMiniRagLoading] = useState(false);
   const [miniRagError, setMiniRagError] = useState<string | null>(null);
+  const [supportOpen, setSupportOpen] = useState(false);
+  const [supportQuestion, setSupportQuestion] = useState("Почему не работает авторизация?");
+  const [supportUserId, setSupportUserId] = useState("");
+  const [supportTicketId, setSupportTicketId] = useState("t_9001");
+  const [supportLoading, setSupportLoading] = useState(false);
+  const [supportError, setSupportError] = useState<string | null>(null);
+  const [supportResult, setSupportResult] = useState<SupportAskResponse | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const loadChats = useCallback(async () => {
@@ -551,6 +560,27 @@ export default function App() {
     ragTopKAfter,
     ragTopKBefore,
   ]);
+
+  const runSupportAskUi = useCallback(async () => {
+    setSupportLoading(true);
+    setSupportError(null);
+    setSupportResult(null);
+    try {
+      const out = await runSupportAsk({
+        question: supportQuestion,
+        user_id: supportUserId.trim() || undefined,
+        ticket_id: supportTicketId.trim() || undefined,
+        top_k_before: Math.max(1, parseInt(ragTopKBefore || "20", 10) || 20),
+        top_k_after: Math.max(1, parseInt(ragTopKAfter || "6", 10) || 6),
+        sim_threshold: Number.parseFloat(ragThreshold || "0.12") || 0.12,
+      });
+      setSupportResult(out);
+    } catch (e: unknown) {
+      setSupportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSupportLoading(false);
+    }
+  }, [ragThreshold, ragTopKAfter, ragTopKBefore, supportQuestion, supportTicketId, supportUserId]);
 
   const handleNewChat = async () => {
     setError(null);
@@ -1221,6 +1251,14 @@ export default function App() {
                 disabled={loading || miniRagLoading}
               >
                 RAG чат
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setSupportOpen(true)}
+                disabled={loading || supportLoading}
+              >
+                Support Assistant
               </button>
             </div>
             {showSettings && activeBranch && (
@@ -2586,6 +2624,97 @@ export default function App() {
               </div>
               <div className="modal-actions">
                 <button type="button" className="btn" onClick={() => setMiniRagOpen(false)}>
+                  Закрыть
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {supportOpen && (
+          <div className="modal-backdrop" role="presentation">
+            <div className="modal modal-wide">
+              <h3>Support Assistant</h3>
+              <p className="hint">
+                Ответы для саппорта с учетом контекста тикета/пользователя (MCP CRM) и RAG по docs/коду.
+              </p>
+              <div className="pipeline-grid">
+                <div className="pipeline-step">
+                  <h4>Запрос</h4>
+                  <label>
+                    Вопрос клиента
+                    <textarea
+                      rows={3}
+                      value={supportQuestion}
+                      onChange={(e) => setSupportQuestion(e.target.value)}
+                    />
+                  </label>
+                  <div className="settings-row">
+                    <label>
+                      ticket_id
+                      <input value={supportTicketId} onChange={(e) => setSupportTicketId(e.target.value)} />
+                    </label>
+                    <label>
+                      user_id (опц.)
+                      <input value={supportUserId} onChange={(e) => setSupportUserId(e.target.value)} />
+                    </label>
+                  </div>
+                  <div className="modal-actions" style={{ justifyContent: "flex-start", marginTop: "0.5rem" }}>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => void runSupportAskUi()}
+                      disabled={supportLoading || !supportQuestion.trim()}
+                    >
+                      {supportLoading ? "Выполняю..." : "Запустить"}
+                    </button>
+                  </div>
+                  {supportError && <div className="memory-err">{supportError}</div>}
+                </div>
+                <div className="pipeline-step">
+                  <h4>Результат</h4>
+                  {!supportResult && !supportError && <p className="hint">Пока нет ответа.</p>}
+                  {supportResult && (
+                    <>
+                      {supportResult.dont_know && (
+                        <p className="memory-err">
+                          Режим «не знаю»: {supportResult.dont_know_reason ?? "недостаточно контекста"}.
+                        </p>
+                      )}
+                      <pre className="text">{supportResult.support_answer}</pre>
+                      <h4>Источники</h4>
+                      {(supportResult.sources ?? []).length === 0 ? (
+                        <p className="hint">Нет источников.</p>
+                      ) : (
+                        <table className="rag-table">
+                          <thead>
+                            <tr>
+                              <th>score</th>
+                              <th>file</th>
+                              <th>section</th>
+                              <th>chunk_id</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(supportResult.sources ?? []).slice(0, 10).map((s) => (
+                              <tr key={s.chunk_id}>
+                                <td>{s.score.toFixed(4)}</td>
+                                <td>{s.file}</td>
+                                <td>{s.section}</td>
+                                <td>{s.chunk_id}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                      <h4>CRM контекст</h4>
+                      <pre className="text mini-rag-transcript">{supportResult.crm_ticket_raw || "(нет ticket)"}</pre>
+                      <pre className="text mini-rag-transcript">{supportResult.crm_user_raw || "(нет user)"}</pre>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn" onClick={() => setSupportOpen(false)}>
                   Закрыть
                 </button>
               </div>

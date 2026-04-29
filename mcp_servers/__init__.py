@@ -4,3 +4,4 @@
 # - mcp_servers.dadata_mcp
 # - mcp_servers.yandex_geocoder_mcp
 # - mcp_servers.project_git_mcp
+# - mcp_servers.support_crm_mcp

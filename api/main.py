@@ -546,6 +546,15 @@ class MCPProjectGitDemoOut(BaseModel):
     diff_raw: str
 
 
+class SupportAskBody(BaseModel):
+    question: str
+    user_id: str | None = None
+    ticket_id: str | None = None
+    top_k_before: int = Field(default=20, ge=1, le=100)
+    top_k_after: int = Field(default=6, ge=1, le=50)
+    sim_threshold: float = 0.12
+
+
 class RAGQueryBody(BaseModel):
     question: str
     mode: str = "both"  # without_rag | with_rag | both
@@ -920,6 +929,109 @@ async def mcp_project_git_demo(body: MCPProjectGitDemoBody) -> MCPProjectGitDemo
         files_raw=files_raw,
         diff_raw=diff_raw,
     )
+
+
+@app.post("/api/support/ask")
+async def support_ask(body: SupportAskBody) -> dict[str, Any]:
+    """Мини-сервис саппорта: вопрос + контекст тикета/пользователя через MCP + RAG-ответ по docs/code."""
+    q = body.question.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="question не может быть пустым")
+
+    from mcp_client import call_tool_text, session_from_profile
+
+    profiles = load_mcp_server_profiles()
+    if not profiles:
+        raise HTTPException(status_code=503, detail="MCP выключен или список серверов пуст.")
+    pref = os.environ.get("MCP_SUPPORT_CRM_SERVER_ID", "supportcrm").strip()
+    prof = next((p for p in profiles if p.id == pref), None)
+    if prof is None:
+        ids = ", ".join(p.id for p in profiles)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Нет MCP-профиля с id={pref!r}. Задайте MCP_SUPPORT_CRM_SERVER_ID или добавьте сервер в MCP_SERVERS_JSON. "
+                f"Сейчас доступны: {ids}"
+            ),
+        )
+
+    timeout_sec = _mcp_connect_timeout_sec()
+    user_raw = ""
+    ticket_raw = ""
+
+    async def _load_crm(session) -> tuple[str, str]:
+        user_txt = ""
+        ticket_txt = ""
+        uid = (body.user_id or "").strip()
+        tid = (body.ticket_id or "").strip()
+        if tid:
+            ticket_txt, ticket_err = await call_tool_text(session, "getTicket", {"ticket_id": tid})
+            if ticket_err:
+                raise HTTPException(status_code=502, detail=f"MCP tool getTicket failed: {ticket_txt or 'unknown error'}")
+            obj = _parse_json_text_or_none(ticket_txt) or {}
+            t = obj.get("ticket")
+            if isinstance(t, dict) and not uid:
+                uid = str(t.get("user_id", "")).strip()
+        if uid:
+            user_txt, user_err = await call_tool_text(session, "getUser", {"user_id": uid})
+            if user_err:
+                raise HTTPException(status_code=502, detail=f"MCP tool getUser failed: {user_txt or 'unknown error'}")
+        return user_txt, ticket_txt
+
+    try:
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_profile(prof) as session:
+                    user_raw, ticket_raw = await _load_crm(session)
+        else:
+            async with session_from_profile(prof) as session:
+                user_raw, ticket_raw = await _load_crm(session)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail=f"MCP: таймаут {timeout_sec:g}s при чтении CRM.") from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
+
+    support_prompt = (
+        "Ты ассистент поддержки пользователей. Отвечай по-русски и предлагай конкретные действия саппорту. "
+        "Опирайся на документацию/код из RAG-контекста и данные пользователя/тикета ниже.\n\n"
+        f"Вопрос клиента: {q}\n\n"
+        f"Контекст пользователя (MCP getUser):\n{user_raw or '(нет)'}\n\n"
+        f"Контекст тикета (MCP getTicket):\n{ticket_raw or '(нет)'}\n\n"
+        "Сформируй ответ так: 1) вероятная причина, 2) шаги проверки, 3) что сделать пользователю."
+    )
+
+    scripts = str(_project_root / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from rag_qa import answer_with_rag
+
+    rag = answer_with_rag(
+        support_prompt,
+        db_path=_project_root / "rag_index.db",
+        strategy="structured",
+        top_k_before=int(body.top_k_before),
+        top_k_after=int(body.top_k_after),
+        sim_threshold=float(body.sim_threshold),
+        rewrite_mode="heuristic",
+        rerank_mode="hybrid",
+        max_context_chars=7500,
+    )
+    return {
+        "ok": True,
+        "question": q,
+        "ticket_id": body.ticket_id,
+        "user_id": body.user_id,
+        "crm_server_id": prof.id,
+        "crm_user_raw": user_raw,
+        "crm_ticket_raw": ticket_raw,
+        "support_answer": rag.get("answer", ""),
+        "sources": rag.get("sources", []),
+        "quotes": rag.get("quotes", []),
+        "dont_know": rag.get("dont_know", False),
+        "dont_know_reason": rag.get("dont_know_reason"),
+    }
 
 
 @app.post("/api/rag/query")

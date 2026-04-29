@@ -1,0 +1,49 @@
+{
+  "users": [
+    {
+      "id": "u_1001",
+      "name": "Ирина Петрова",
+      "plan": "pro",
+      "locale": "ru",
+      "created_at": "2025-10-12",
+      "last_login_at": "2026-04-27T18:10:00Z"
+    },
+    {
+      "id": "u_1002",
+      "name": "Сергей Орлов",
+      "plan": "free",
+      "locale": "ru",
+      "created_at": "2026-02-03",
+      "last_login_at": "2026-04-19T09:15:00Z"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "t_9001",
+      "user_id": "u_1001",
+      "status": "open",
+      "category": "auth",
+      "subject": "Не работает авторизация после смены пароля",
+      "description": "После сброса пароля мобильное приложение пишет invalid_token.",
+      "error_code": "invalid_token",
+      "created_at": "2026-04-28T07:21:00Z",
+      "client": {
+        "platform": "ios",
+        "app_version": "2.9.1"
+      }
+    },
+    {
+      "id": "t_9002",
+      "user_id": "u_1002",
+      "status": "open",
+      "category": "billing",
+      "subject": "Не вижу оплату подписки",
+      "description": "Оплатил сегодня, но план по-прежнему free.",
+      "created_at": "2026-04-26T11:02:00Z",
+      "client": {
+        "platform": "web",
+        "app_version": "web"
+      }
+    }
+  ]
+}

@@ -128,6 +128,21 @@ export type RagBenchmarkResponse = {
   report_preview: string;
 };
 
+export type SupportAskResponse = {
+  ok: boolean;
+  question: string;
+  ticket_id?: string | null;
+  user_id?: string | null;
+  crm_server_id: string;
+  crm_user_raw?: string;
+  crm_ticket_raw?: string;
+  support_answer: string;
+  sources: RagSource[];
+  quotes?: RagQuote[];
+  dont_know?: boolean;
+  dont_know_reason?: string | null;
+};
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
@@ -211,6 +226,23 @@ export async function runRagMiniChatTurn(body: {
 }): Promise<RagMiniChatTurnResponse> {
   return json(
     await fetch("/api/rag/mini_chat/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function runSupportAsk(body: {
+  question: string;
+  user_id?: string;
+  ticket_id?: string;
+  top_k_before?: number;
+  top_k_after?: number;
+  sim_threshold?: number;
+}): Promise<SupportAskResponse> {
+  return json(
+    await fetch("/api/support/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
