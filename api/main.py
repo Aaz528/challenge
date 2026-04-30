@@ -546,6 +546,27 @@ class MCPProjectGitDemoOut(BaseModel):
     diff_raw: str
 
 
+class MCPFileAssistantDemoBody(BaseModel):
+    query: str = "auth"
+    read_path: str = "chat_service.py"
+    read_start_line: int = Field(default=1, ge=1, le=100000)
+    read_max_lines: int = Field(default=60, ge=1, le=2000)
+    search_glob: str = "*.py"
+    analyze_paths: list[str] = Field(default_factory=lambda: ["chat_service.py", "api/main.py"])
+    write_path: str | None = None
+    write_content: str = ""
+    write_overwrite: bool = False
+
+
+class MCPFileAssistantDemoOut(BaseModel):
+    ok: bool
+    server_id: str
+    read_raw: str
+    search_raw: str
+    analyze_raw: str
+    write_raw: str | None = None
+
+
 class SupportAskBody(BaseModel):
     question: str
     user_id: str | None = None
@@ -928,6 +949,103 @@ async def mcp_project_git_demo(body: MCPProjectGitDemoBody) -> MCPProjectGitDemo
         branch_raw=branch_raw,
         files_raw=files_raw,
         diff_raw=diff_raw,
+    )
+
+
+@app.post("/api/mcp/file-assistant-demo", response_model=MCPFileAssistantDemoOut)
+async def mcp_file_assistant_demo(body: MCPFileAssistantDemoBody) -> MCPFileAssistantDemoOut:
+    """Учебный прогон file-assistant MCP: read + search + analyze (+ optional write)."""
+    from mcp_client import call_tool_text, session_from_profile
+
+    profiles = load_mcp_server_profiles()
+    if not profiles:
+        raise HTTPException(status_code=503, detail="MCP выключен или список серверов пуст.")
+    pref = os.environ.get("MCP_FILE_ASSISTANT_SERVER_ID", "fileassist").strip()
+    prof = next((p for p in profiles if p.id == pref), None)
+    if prof is None:
+        ids = ", ".join(p.id for p in profiles)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Нет MCP-профиля с id={pref!r}. Задайте MCP_FILE_ASSISTANT_SERVER_ID или добавьте сервер в MCP_SERVERS_JSON. "
+                f"Сейчас доступны: {ids}"
+            ),
+        )
+    timeout_sec = _mcp_connect_timeout_sec()
+
+    async def _run_demo(session) -> tuple[str, str, str, str | None]:
+        read_raw, read_err = await call_tool_text(
+            session,
+            "readProjectFile",
+            {
+                "path": body.read_path,
+                "start_line": int(body.read_start_line),
+                "max_lines": int(body.read_max_lines),
+            },
+        )
+        if read_err:
+            raise HTTPException(status_code=502, detail=f"MCP tool readProjectFile failed: {read_raw or 'unknown error'}")
+        search_raw, search_err = await call_tool_text(
+            session,
+            "searchProject",
+            {"pattern": body.query, "glob": body.search_glob, "max_results": 80},
+        )
+        if search_err:
+            raise HTTPException(status_code=502, detail=f"MCP tool searchProject failed: {search_raw or 'unknown error'}")
+        analyze_raw, analyze_err = await call_tool_text(
+            session,
+            "analyzeFiles",
+            {"file_paths": body.analyze_paths, "question": body.query},
+        )
+        if analyze_err:
+            raise HTTPException(status_code=502, detail=f"MCP tool analyzeFiles failed: {analyze_raw or 'unknown error'}")
+        write_raw: str | None = None
+        if body.write_path:
+            write_raw, write_err = await call_tool_text(
+                session,
+                "writeProjectFile",
+                {
+                    "path": body.write_path,
+                    "content": body.write_content,
+                    "overwrite": bool(body.write_overwrite),
+                },
+            )
+            if write_err:
+                raise HTTPException(status_code=502, detail=f"MCP tool writeProjectFile failed: {write_raw or 'unknown error'}")
+        return read_raw, search_raw, analyze_raw, write_raw
+
+    try:
+        if timeout_sec > 0:
+            async with asyncio.timeout(timeout_sec):
+                async with session_from_profile(prof) as session:
+                    read_raw, search_raw, analyze_raw, write_raw = await _run_demo(session)
+        else:
+            async with session_from_profile(prof) as session:
+                read_raw, search_raw, analyze_raw, write_raw = await _run_demo(session)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail=f"MCP: таймаут {timeout_sec:g}s при file-assistant demo.") from None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MCP: {_mcp_error_detail(e)}") from e
+
+    for tool_name, raw in (
+        ("readProjectFile", read_raw),
+        ("searchProject", search_raw),
+        ("analyzeFiles", analyze_raw),
+    ):
+        if _parse_json_text_or_none(raw) is None:
+            raise HTTPException(status_code=502, detail=f"{tool_name} вернул не-JSON текст")
+    if write_raw is not None and _parse_json_text_or_none(write_raw) is None:
+        raise HTTPException(status_code=502, detail="writeProjectFile вернул не-JSON текст")
+
+    return MCPFileAssistantDemoOut(
+        ok=True,
+        server_id=prof.id,
+        read_raw=read_raw,
+        search_raw=search_raw,
+        analyze_raw=analyze_raw,
+        write_raw=write_raw,
     )
 
 

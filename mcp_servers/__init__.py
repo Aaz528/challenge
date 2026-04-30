@@ -5,3 +5,4 @@
 # - mcp_servers.yandex_geocoder_mcp
 # - mcp_servers.project_git_mcp
 # - mcp_servers.support_crm_mcp
+# - mcp_servers.file_assistant_mcp

@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "scenarios": [
+    "find_api_usages",
+    "check_file_invariants",
+    "generate_changelog"
+  ],
+  "outputs": [
+    "/home/nout/projects/challenge/artifacts/file_assistant_scenarios/scenario1_api_usage_report.md",
+    "/home/nout/projects/challenge/artifacts/file_assistant_scenarios/scenario2_invariants_report.md",
+    "/home/nout/projects/challenge/artifacts/file_assistant_scenarios/scenario3_changelog.md"
+  ]
+}
